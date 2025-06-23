@@ -70,7 +70,7 @@ class WorkflowConfiguration:
 class MultiAgentConfiguration:
     """Configuration for the multi-agent implementation (multi_agent.py)."""
     # Common configuration
-    search_api: SearchAPI = SearchAPI.TAVILY
+    search_api: SearchAPI = SearchAPI.GOOGLESEARCH
     search_api_config: Optional[Dict[str, Any]] = None
     process_search_results: Literal["summarize", "split_and_rerank"] | None = None
     summarization_model_provider: str = "anthropic"
@@ -80,7 +80,7 @@ class MultiAgentConfiguration:
     # Multi-agent specific configuration
     number_of_queries: int = 2 # Number of search queries to generate per section
     supervisor_model: str = "anthropic:claude-3-7-sonnet-latest"
-    researcher_model: str = "anthropic:claude-3-7-sonnet-latest"
+    researcher_model: str = "google_genai:gemini-2.5-flash-lite-preview-06-17"
     ask_for_clarification: bool = False # Whether to ask for clarification from the user
     # MCP server configuration
     mcp_server_config: Optional[Dict[str, Any]] = None

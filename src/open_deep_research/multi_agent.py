@@ -19,8 +19,102 @@ from open_deep_research.utils import (
     duckduckgo_search,
     get_today_str,
 )
+from open_deep_research.message_manager import validate_and_fix_messages
+from open_deep_research.message_converter import convert_langchain_messages_to_dict
 
 from open_deep_research.prompts import SUPERVISOR_INSTRUCTIONS, RESEARCH_INSTRUCTIONS
+
+
+def _infer_message_role(msg) -> str:
+    """推断消息角色，支持字典格式和 LangChain 消息对象"""
+    if isinstance(msg, dict):
+        return msg.get("role", "unknown")
+    
+    # 尝试直接获取 role 属性
+    if hasattr(msg, "role"):
+        return msg.role
+    
+    # 根据类型名称推断角色
+    msg_type = type(msg).__name__.lower()
+    role_mapping = {
+        "human": "user",
+        "user": "user", 
+        "ai": "assistant",
+        "assistant": "assistant",
+        "system": "system",
+        "tool": "tool"
+    }
+    
+    for key, role in role_mapping.items():
+        if key in msg_type:
+            return role
+    
+    return "unknown"
+
+
+def fix_gemini_message_sequence(messages) -> list:
+    """
+    修复消息序列以符合 Gemini API 要求
+    
+    Gemini 要求：
+    - function call 必须紧跟在 user turn 或 function response turn 之后
+    - 不能有连续的 assistant 消息
+    - 最后一条消息最好是 user 消息
+    
+    Args:
+        messages: 消息列表，支持字典格式和 LangChain 消息对象
+        
+    Returns:
+        修复后的消息列表
+    """
+    if not messages:
+        return messages
+        
+    fixed_messages = []
+    last_role = None
+    
+    for msg in messages:
+        current_role = _infer_message_role(msg)
+        
+        # 检查是否有连续的 assistant 消息
+        if current_role == "assistant" and last_role == "assistant":
+            # 插入分隔用的 user 消息
+            fixed_messages.append({
+                "role": "user", 
+                "content": "Continue with the next step."
+            })
+        
+        fixed_messages.append(msg)
+        last_role = current_role
+        
+    return fixed_messages
+
+
+def ensure_user_message_ending(messages, default_content: str = "Please continue.") -> list:
+    """
+    确保消息序列以 user 消息结尾（Gemini 推荐）
+    
+    Args:
+        messages: 消息列表
+        default_content: 默认的用户消息内容
+        
+    Returns:
+        确保以 user 消息结尾的消息列表
+    """
+    if not messages:
+        return messages
+    
+    last_msg = messages[-1]
+    last_role = _infer_message_role(last_msg)
+    
+    if last_role != "user":
+        messages = messages.copy()  # 避免修改原列表
+        messages.append({
+            "role": "user", 
+            "content": default_content
+        })
+    
+    return messages
 
 ## Tools factory - will be initialized based on configuration
 def get_search_tool(config: RunnableConfig):
@@ -205,13 +299,24 @@ async def supervisor(state: ReportState, config: RunnableConfig):
 
     # Get tools based on configuration
     supervisor_tool_list = await get_supervisor_tools(config)
-    
+
+    # 🔧 Convert LangChain message objects to dict format for message manager
+    dict_messages = convert_langchain_messages_to_dict(messages)
+
+    # 🔧 Fix Gemini message sequence problem:
+    # Invalid argument provided to Gemini: 400 Please ensure that function call turn comes immediately after a user turn or after a function response turn response turn is not allowed to be followed by a function call turn
+    # 使用全局消息管理器处理消息序列
+    supervisor_model = get_config_value(configurable.supervisor_model)
+    provider_hint = supervisor_model.split(":")[0] if ":" in supervisor_model else supervisor_model
+    messages, fixes = validate_and_fix_messages(dict_messages, provider_hint)
+    if fixes:
+        print(f"[Supervisor] 消息序列修复: {', '.join(fixes)}")
     
     llm_with_tools = (
         llm
         .bind_tools(
             supervisor_tool_list,
-            parallel_tool_calls=False,
+            # parallel_tool_calls=False,
             # force at least one tool call
             tool_choice="any"
         )
@@ -222,18 +327,18 @@ async def supervisor(state: ReportState, config: RunnableConfig):
     if configurable.mcp_prompt:
         system_prompt += f"\n\n{configurable.mcp_prompt}"
 
+    # Prepare the final messages for LLM (system + user messages)
+    llm_messages = [
+        {
+            "role": "system",
+            "content": system_prompt
+        }
+    ] + messages
+
     # Invoke
     return {
         "messages": [
-            await llm_with_tools.ainvoke(
-                [
-                    {
-                        "role": "system",
-                        "content": system_prompt
-                    }
-                ]
-                + messages
-            )
+            await llm_with_tools.ainvoke(llm_messages)
         ]
     }
 
@@ -372,23 +477,38 @@ async def research_agent(state: SectionState, config: RunnableConfig):
     if not messages:
         messages = [{"role": "user", "content": f"Please research and write the section: {state['section']}"}]
 
-    return {
+    # 🔧 Convert LangChain message objects to dict format for message manager
+    dict_messages = convert_langchain_messages_to_dict(messages)
+
+    # 🔧 Fix Gemini message sequence problem:
+    # Invalid argument provided to Gemini: 400 Please ensure that function call turn comes immediately after a user turn or after a function response turn response turn is not allowed to be followed by a function call turn
+    # 使用全局消息管理器处理消息序列
+    provider_hint = researcher_model.split(":")[0] if ":" in researcher_model else researcher_model
+    messages, fixes = validate_and_fix_messages(dict_messages, provider_hint)
+    if fixes:
+        print(f"[Researcher] 消息序列修复: {', '.join(fixes)}")
+
+    # Prepare the final messages for LLM (system + user messages)
+    llm_messages = [
+        {
+            "role": "system",
+            "content": system_prompt
+        }
+    ] + messages
+
+    result = {
         "messages": [
             # Enforce tool calling to either perform more search or call the Section tool to write the section
             await llm.bind_tools(research_tool_list,             
-                                 parallel_tool_calls=False,
+                                #  parallel_tool_calls=False,
                                  # force at least one tool call
-                                 tool_choice="any").ainvoke(
-                [
-                    {
-                        "role": "system",
-                        "content": system_prompt
-                    }
-                ]
-                + messages
-            )
+                                 tool_choice="any").ainvoke(llm_messages)
         ]
     }
+    
+    print(result)
+    
+    return result
 
 async def research_agent_tools(state: SectionState, config: RunnableConfig):
     """Performs the tool call and route to supervisor or continue the research loop"""
@@ -446,8 +566,8 @@ async def research_agent_should_continue(state: SectionState) -> str:
 
     messages = state["messages"]
     last_message = messages[-1]
-
-    if last_message.tool_calls[0]["name"] == "FinishResearch":
+    # If the model did not make a tool call, or called FinishResearch, then end the current research branch
+    if not last_message.tool_calls or last_message.tool_calls[0]["name"] == "FinishResearch":
         # Research is done - return to supervisor
         return END
     else:

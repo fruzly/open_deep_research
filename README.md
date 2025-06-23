@@ -96,7 +96,7 @@ Available search tools:
 * [PubMed](https://pubmed.ncbi.nlm.nih.gov/) - Biomedical literature from MEDLINE, life science journals, and online books
 * [Linkup API](https://www.linkup.so/) - General web search
 * [DuckDuckGo API](https://duckduckgo.com/) - General web search
-* [Google Search API/Scrapper](https://google.com/) - Create custom search engine [here](https://programmablesearchengine.google.com/controlpanel/all) and get API key [here](https://developers.google.com/custom-search/v1/introduction)
+* [Google Search API/Scrapper](https://google.com/) - Create custom search engine [here](https://programmablesearchengine.google.com/controlpanel/all) and get API key [here](https://developers.google.com/custom-search/v1/introduction) and add googlesearch [here](https://github.com/langchain-ai/open_deep_research/pull/56)
 * [Microsoft Azure AI Search](https://azure.microsoft.com/en-us/products/ai-services/ai-search) - Cloud based vector database solution 
 
 Open Deep Research is compatible with many different LLMs: 
@@ -437,3 +437,11 @@ Follow the [quickstart](#-quickstart) to start LangGraph server locally.
 ### Hosted deployment
  
 You can easily deploy to [LangGraph Platform](https://langchain-ai.github.io/langgraph/concepts/#deployment-options). 
+
+
+## Supported model providers
+```
+cohere, together, huggingface, azure_ai, ollama, anthropic, google_vertexai, bedrock, deepseek, groq, openai, google_genai, azure_openai, bedrock_converse, xai, google_anthropic_vertex, fireworks, perplexity, ibm, mistralai
+```
+
+大模型使用参考：src\open_deep_research\graph.ipynb

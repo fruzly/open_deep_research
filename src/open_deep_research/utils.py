@@ -1620,7 +1620,9 @@ def stitch_documents_by_url(documents: list[Document]) -> list[Document]:
 
 def get_today_str() -> str:
     """Get current date in a human-readable format."""
-    return datetime.datetime.now().strftime("%a %b %-d, %Y")
+    # return datetime.datetime.now().strftime("%a %b %-d, %Y")
+    # # Use %d instead of %-d for Windows compatibility
+    return datetime.datetime.now().strftime("%a %b %d, %Y")
 
 
 async def load_mcp_server_config(path: str) -> dict:

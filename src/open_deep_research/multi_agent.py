@@ -17,6 +17,9 @@ from open_deep_research.utils import (
     get_config_value,
     tavily_search,
     duckduckgo_search,
+    gemini_google_search,
+    azureaisearch_search,
+    deduplicate_and_format_sources,
     get_today_str,
 )
 from open_deep_research.message_manager import validate_and_fix_messages
@@ -131,11 +134,25 @@ def get_search_tool(config: RunnableConfig):
         search_tool = tavily_search
     elif search_api.lower() == "duckduckgo":
         search_tool = duckduckgo_search
+    elif search_api.lower() == "googlesearch":
+        # Import the new google search tool
+        from .utils import google_search_async
+        # Create a simple wrapper tool for google search
+        @tool
+        async def google_search_tool(queries: List[str]) -> str:
+            """Perform Google searches using Google Custom Search API or web scraping."""
+            search_results = await google_search_async(queries, max_results=5, include_raw_content=True)
+            return deduplicate_and_format_sources(search_results, max_tokens_per_source=4000, deduplication_strategy="keep_first")
+        search_tool = google_search_tool
+    elif search_api.lower() == "geminigooglesearch":
+        search_tool = gemini_google_search
+    elif search_api.lower() == "azureaisearch":
+        search_tool = azureaisearch_search
     else:
         raise NotImplementedError(
             f"The search API '{search_api}' is not yet supported in the multi-agent implementation. "
-            f"Currently, only Tavily/DuckDuckGo/None is supported. Please use the graph-based implementation in "
-            f"src/open_deep_research/graph.py for other search APIs, or set search_api to 'tavily', 'duckduckgo', or 'none'."
+            f"Currently, only Tavily/DuckDuckGo/GoogleSearch/GeminiGoogleSearch/AzureAISearch/None is supported. Please use the graph-based implementation in "
+            f"src/open_deep_research/graph.py for other search APIs, or set search_api to one of the supported options."
         )
 
     tool_metadata = {**(search_tool.metadata or {}), "type": "search"}

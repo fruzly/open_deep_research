@@ -37,6 +37,7 @@ from langchain_community.utilities.pubmed import PubMedAPIWrapper
 from langchain_core.tools import tool
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langsmith import traceable
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 from open_deep_research.configuration import Configuration
 from open_deep_research.state import Section
@@ -73,7 +74,9 @@ def get_search_params(search_api: str, search_api_config: Optional[Dict[str, Any
         "arxiv": ["load_max_docs", "get_full_documents", "load_all_available_meta"],
         "pubmed": ["top_k_results", "email", "api_key", "doc_content_chars_max"],
         "linkup": ["depth"],
-        "googlesearch": ["max_results"],
+        "googlesearch": ["max_results", "include_raw_content"],
+        "geminigooglesearch": ["max_results", "include_raw_content"],
+        "azureaisearch": ["max_results", "topic", "include_raw_content"],
     }
 
     # Get the list of accepted parameters for the given search API
@@ -1185,6 +1188,92 @@ async def google_search_async(search_queries: Union[str, List[str]], max_results
         if executor:
             executor.shutdown(wait=False)
 
+@traceable
+async def gemini_google_search_async(search_queries: Union[str, List[str]], max_results: int = 5, include_raw_content: bool = True):
+    """
+    使用 Gemini 进行增强搜索（结合 Google 搜索和 AI 分析）
+    
+    Args:
+        search_queries (Union[str, List[str]]): 搜索查询列表
+        max_results (int): 每个查询返回的最大结果数
+        include_raw_content (bool): 是否包含原始内容
+        
+    Returns:
+        List[dict]: 格式化的搜索结果列表
+    """
+    # 确保 search_queries 是列表格式
+    if isinstance(search_queries, str):
+        search_queries = [search_queries]
+    
+    # 首先使用常规 Google 搜索获取结果
+    search_results = await google_search_async(search_queries, max_results, include_raw_content)
+    
+    # 检查是否有 Gemini API Key 用于增强分析
+    if not os.environ.get("GEMINI_API_KEY"):
+        print("⚠️  未设置 GEMINI_API_KEY，使用常规 Google 搜索结果")
+        return search_results
+    
+    # 使用 Gemini 对搜索结果进行增强分析
+    try:
+        gemini_model = ChatGoogleGenerativeAI(
+            model="gemini-2.5-flash-lite-preview-06-17",
+            temperature=0,
+            max_retries=2
+        )
+        
+        enhanced_results = []
+        
+        for result in search_results:
+            query = result['query']
+            
+            # 构建分析提示
+            sources_summary = "\n".join([
+                f"标题: {item['title']}\nURL: {item['url']}\n内容: {item['content'][:300]}...\n"
+                for item in result['results'][:3]  # 只分析前3个结果
+            ])
+            
+            analysis_prompt = f"""
+            基于以下搜索结果，为查询 "{query}" 提供一个综合性的分析和总结：
+
+            搜索结果：
+            {sources_summary}
+
+            请提供：
+            1. 对查询主题的简洁总结（2-3句话）
+            2. 关键发现和重要信息
+            3. 可能的后续问题或相关主题
+
+            当前日期：{datetime.datetime.now().strftime('%Y-%m-%d')}
+            """
+            
+            try:
+                # 调用 Gemini 进行分析
+                response = await gemini_model.ainvoke(analysis_prompt)
+                ai_analysis = response.content if hasattr(response, 'content') else str(response)
+                
+                # 增强原始结果
+                enhanced_result = {
+                    **result,
+                    "answer": ai_analysis,
+                    "enhanced_by_gemini": True
+                }
+                enhanced_results.append(enhanced_result)
+                
+                # 添加延迟避免速率限制
+                await asyncio.sleep(0.5)
+                
+            except Exception as e:
+                print(f"Gemini 分析失败 for query '{query}': {str(e)}")
+                # 如果 Gemini 分析失败，返回原始结果
+                enhanced_results.append(result)
+        
+        return enhanced_results
+        
+    except Exception as e:
+        print(f"Gemini Google Search 初始化错误: {str(e)}")
+        # 如果 Gemini 不可用，返回常规搜索结果
+        return search_results
+
 async def scrape_pages(titles: List[str], urls: List[str]) -> str:
     """
     Scrapes content from a list of URLs and formats it into a readable markdown document.
@@ -1498,6 +1587,87 @@ async def azureaisearch_search(queries: List[str], max_results: int = 5, topic: 
         return "No valid search results found. Please try different search queries or use a different search API."
 
 
+@tool
+async def gemini_google_search(
+    queries: List[str],
+    max_results: Annotated[int, InjectedToolArg] = 5,
+    config: RunnableConfig = None
+) -> str:
+    """
+    使用 Gemini 原生 Google Search 工具进行搜索
+    
+    Args:
+        queries (List[str]): 搜索查询列表
+        max_results (int): 最大结果数
+        config: 运行配置
+        
+    Returns:
+        str: 格式化的搜索结果字符串
+    """
+    # 使用 gemini_google_search_async 进行搜索
+    search_results = await gemini_google_search_async(
+        queries,
+        max_results=max_results,
+        include_raw_content=True
+    )
+    
+    # 格式化输出
+    formatted_output = "Google Search Results (via Gemini):\n\n"
+    
+    # 去重并格式化结果
+    unique_results = {}
+    for response in search_results:
+        for result in response['results']:
+            url = result['url']
+            if url not in unique_results:
+                unique_results[url] = {**result, "query": response['query']}
+    
+    # 处理搜索结果
+    async def noop():
+        return None
+    
+    # 如果配置了结果处理，应用相应的处理方式
+    configurable = Configuration.from_runnable_config(config) if config else None
+    max_char_to_include = 30_000
+    
+    if configurable and configurable.process_search_results == "summarize":
+        # 使用摘要模式处理结果
+        if configurable.summarization_model_provider == "anthropic":
+            extra_kwargs = {"betas": ["extended-cache-ttl-2025-04-11"]}
+        else:
+            extra_kwargs = {}
+
+        summarization_model = init_chat_model(
+            model=configurable.summarization_model,
+            model_provider=configurable.summarization_model_provider,
+            max_retries=configurable.max_structured_output_retries,
+            **extra_kwargs
+        )
+        summarization_tasks = [
+            noop() if not result.get("raw_content") else summarize_webpage(summarization_model, result['raw_content'][:max_char_to_include])
+            for result in unique_results.values()
+        ]
+        summaries = await asyncio.gather(*summarization_tasks)
+        unique_results = {
+            url: {'title': result['title'], 'content': result['content'] if summary is None else summary}
+            for url, result, summary in zip(unique_results.keys(), unique_results.values(), summaries)
+        }
+    
+    # 格式化最终输出
+    for i, (url, result) in enumerate(unique_results.items()):
+        formatted_output += f"\n\n--- SOURCE {i+1}: {result['title']} ---\n"
+        formatted_output += f"URL: {url}\n\n"
+        formatted_output += f"SUMMARY:\n{result['content']}\n\n"
+        if result.get('raw_content'):
+            formatted_output += f"FULL CONTENT:\n{result['raw_content'][:max_char_to_include]}"
+        formatted_output += "\n\n" + "-" * 80 + "\n"
+    
+    if unique_results:
+        return formatted_output
+    else:
+        return "No valid search results found using Gemini Google Search. Please try different search queries."
+
+
 async def select_and_execute_search(search_api: str, query_list: list[str], params_to_pass: dict) -> str:
     """Select and execute the appropriate search API.
     
@@ -1533,6 +1703,8 @@ async def select_and_execute_search(search_api: str, query_list: list[str], para
         search_results = await google_search_async(query_list, **params_to_pass)
     elif search_api == "azureaisearch":
         search_results = await azureaisearch_search_async(query_list, **params_to_pass)
+    elif search_api == "geminigooglesearch":
+        search_results = await gemini_google_search_async(query_list, **params_to_pass)
     else:
         raise ValueError(f"Unsupported search API: {search_api}")
 

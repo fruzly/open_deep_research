@@ -1,7 +1,7 @@
 import os
 from enum import Enum
 from dataclasses import dataclass, fields, field
-from typing import Any, Optional, Dict, Literal
+from typing import Any, Optional, Dict, Literal, List
 
 from langchain_core.runnables import RunnableConfig
 
@@ -52,6 +52,10 @@ class WorkflowConfiguration:
     writer_provider: str = "anthropic"
     writer_model: str = "claude-3-7-sonnet-latest"
     writer_model_kwargs: Optional[Dict[str, Any]] = None
+    
+    # Intelligent research mode configuration
+    research_mode: Optional[str] = "simple"  # simple, reflective, extended, iterative, collaborative
+    max_research_iterations: Optional[int] = 3  # Maximum number of intelligent research iterations
 
     @classmethod
     def from_runnable_config(
@@ -88,6 +92,10 @@ class MultiAgentConfiguration:
     mcp_server_config: Optional[Dict[str, Any]] = None
     mcp_prompt: Optional[str] = None
     mcp_tools_to_include: Optional[list[str]] = None
+    
+    # Intelligent research mode configuration
+    research_mode: Optional[str] = "simple"  # simple, reflective, extended, iterative, collaborative
+    max_research_iterations: Optional[int] = 3  # Maximum number of intelligent research iterations
 
     @classmethod
     def from_runnable_config(

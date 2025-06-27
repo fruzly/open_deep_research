@@ -1,8 +1,9 @@
 from open_deep_research.configuration import DEFAULT_REPORT_STRUCTURE, SearchAPI
 from dataclasses import dataclass, fields
-from typing import Optional, Dict, Any, Literal
+from typing import Optional, Dict, Any, Literal, List
 from langchain_core.runnables import RunnableConfig
 import os
+from enum import Enum
 
 
 @dataclass(kw_only=True)
@@ -29,6 +30,10 @@ class WorkflowConfiguration:
     writer_provider: str = "anthropic"
     writer_model: str = "claude-3-7-sonnet-latest"
     writer_model_kwargs: Optional[Dict[str, Any]] = None
+    
+    # intelligent research mode configuration
+    research_mode: Optional[str] = "simple"  # simple, reflective, extended, iterative, collaborative
+    max_research_iterations: Optional[int] = 3  # maximum number of intelligent research iterations
 
     @classmethod
     def from_runnable_config(

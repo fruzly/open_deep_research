@@ -2,6 +2,7 @@ import os
 import asyncio
 import json
 import datetime
+import re
 import requests
 import random 
 import concurrent
@@ -13,6 +14,7 @@ from typing import List, Optional, Dict, Any, Union, Literal, Annotated, cast
 from urllib.parse import unquote
 from collections import defaultdict
 import itertools
+import platform
 
 from exa_py import Exa
 from linkup import LinkupClient
@@ -43,17 +45,67 @@ from open_deep_research.configuration import Configuration
 from open_deep_research.state import Section
 from open_deep_research.prompts import SUMMARIZATION_PROMPT
 
+import structlog
+logger = structlog.get_logger(__name__)
 
-def get_config_value(value):
+# Import smart content fetching functionality from playwright_utils
+try:
+    from open_deep_research.playwright_utils import smart_content_fetch, fetch_with_playwright
+    PLAYWRIGHT_UTILS_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_UTILS_AVAILABLE = False
+    logger.warning("playwright_utils module not available, some advanced content fetching features will be limited")
+
+
+def get_config_value(value, default_value=None):
     """
     Helper function to handle string, dict, and enum cases of configuration values
+    
+    Args:
+        value: The configuration value to process
+        default_value: Default value to return if value is None or invalid
+    
+    Returns:
+        Processed configuration value or default_value
     """
+    if value is None:
+        return default_value
+    
     if isinstance(value, str):
         return value
     elif isinstance(value, dict):
         return value
     else:
-        return value.value
+        try:
+            return value.value
+        except AttributeError:
+            return default_value if default_value is not None else value
+
+def get_config_value_from_runnable(config: RunnableConfig, key: str, default_value=None):
+    """
+    Helper function to get configuration value from RunnableConfig
+    
+    Args:
+        config: RunnableConfig object or dictionary
+        key: Configuration key name
+        default_value: Default value
+    
+    Returns:
+        Configuration value or default value
+    """
+    if not config:
+        return default_value
+    
+    # If config is a dictionary type (RunnableConfig)
+    if isinstance(config, dict) and 'configurable' in config:
+        return config['configurable'].get(key, default_value)
+    
+    # If config has configurable attribute
+    if hasattr(config, 'configurable') and config.configurable:
+        return config.configurable.get(key, default_value)
+    
+    # Fallback to direct access (backward compatibility)
+    return getattr(config, key, default_value) if hasattr(config, key) else default_value
 
 def get_search_params(search_api: str, search_api_config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """
@@ -91,7 +143,7 @@ def get_search_params(search_api: str, search_api_config: Optional[Dict[str, Any
 
 def deduplicate_and_format_sources(
     search_response,
-    max_tokens_per_source=5000,
+    max_tokens_per_source=20000,
     include_raw_content=True,
     deduplication_strategy: Literal["keep_first", "keep_last"] = "keep_first"
 ):
@@ -114,10 +166,11 @@ def deduplicate_and_format_sources(
     Returns:
         str: Formatted string with deduplicated sources
     """
+    logger.info(f"deduplicate_and_format_sources - search_response: {search_response}")
      # Collect all results
     sources_list = []
     for response in search_response:
-        sources_list.extend(response['results'])
+        sources_list.extend(response['content'])
 
     # Deduplicate by URL
     if deduplication_strategy == "keep_first":
@@ -145,7 +198,7 @@ def deduplicate_and_format_sources(
             raw_content = source.get('raw_content', '')
             if raw_content is None:
                 raw_content = ''
-                print(f"Warning: No raw_content found for source {source['url']}")
+                logger.warning(f"Source content missing raw_content - source_url: {source['url']}")
             if len(raw_content) > char_limit:
                 raw_content = raw_content[:char_limit] + "... [truncated]"
             formatted_text += f"Full source content limited to {max_tokens_per_source} tokens: {raw_content}\n\n"
@@ -202,21 +255,34 @@ async def tavily_search_async(search_queries, max_results: int = 5, topic: Liter
                     ]
                 }
     """
-    tavily_async_client = AsyncTavilyClient()
-    search_tasks = []
-    for query in search_queries:
-            search_tasks.append(
-                tavily_async_client.search(
-                    query,
-                    max_results=max_results,
-                    include_raw_content=include_raw_content,
-                    topic=topic
+    logger.info(f"Starting Tavily search - queries_count: {len(search_queries)}, max_results: {max_results}, topic: {topic}, include_raw_content: {include_raw_content}, queries: {search_queries[:3]}")
+    
+    try:
+        tavily_async_client = AsyncTavilyClient()
+        search_tasks = []
+        for query in search_queries:
+                search_tasks.append(
+                    tavily_async_client.search(
+                        query,
+                        max_results=max_results,
+                        include_raw_content=include_raw_content,
+                        topic=topic
+                    )
                 )
-            )
 
-    # Execute all searches concurrently
-    search_docs = await asyncio.gather(*search_tasks)
-    return search_docs
+        logger.debug(f"Preparing to execute concurrent search - tasks_count: {len(search_tasks)}")
+        
+        # Execute all searches concurrently
+        search_docs = await asyncio.gather(*search_tasks)
+        
+        total_results = sum(len(doc.get('results', [])) for doc in search_docs)
+        logger.info(f"Tavily search completed - queries_processed: {len(search_queries)}, total_results: {total_results}, avg_results_per_query: {total_results / len(search_queries) if search_queries else 0}")
+        
+        return search_docs
+        
+    except Exception as e:
+        logger.error(f"Tavily search failed - error: {str(e)}, error_type: {type(e).__name__}, queries_count: {len(search_queries)}")
+        raise
 
 @traceable
 async def azureaisearch_search_async(search_queries: list[str], max_results: int = 5, topic: str = "general", include_raw_content: bool = True) -> list[dict]:
@@ -304,72 +370,109 @@ def perplexity_search(search_queries):
                 ]
             }
     """
+    logger.info(f"Starting Perplexity search - queries_count: {len(search_queries)}, queries: {search_queries[:3]}")
+    
+    # Check API key
+    api_key = os.getenv('PERPLEXITY_API_KEY')
+    if not api_key:
+        logger.error("PERPLEXITY_API_KEY environment variable not found")
+        raise ValueError("PERPLEXITY_API_KEY environment variable is required")
 
     headers = {
         "accept": "application/json",
         "content-type": "application/json",
-        "Authorization": f"Bearer {os.getenv('PERPLEXITY_API_KEY')}"
+        "Authorization": f"Bearer {api_key}"
     }
     
     search_docs = []
-    for query in search_queries:
-
-        payload = {
-            "model": "sonar-pro",
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "Search the web and provide factual information with sources."
-                },
-                {
-                    "role": "user",
-                    "content": query
-                }
-            ]
-        }
+    for i, query in enumerate(search_queries):
+        logger.debug(f"Processing Perplexity query - query_index: {i+1}, query: {query}")
         
-        response = requests.post(
-            "https://api.perplexity.ai/chat/completions",
-            headers=headers,
-            json=payload
-        )
-        response.raise_for_status()  # Raise exception for bad status codes
-        
-        # Parse the response
-        data = response.json()
-        content = data["choices"][0]["message"]["content"]
-        citations = data.get("citations", ["https://perplexity.ai"])
-        
-        # Create results list for this query
-        results = []
-        
-        # First citation gets the full content
-        results.append({
-            "title": f"Perplexity Search, Source 1",
-            "url": citations[0],
-            "content": content,
-            "raw_content": content,
-            "score": 1.0  # Adding score to match Tavily format
-        })
-        
-        # Add additional citations without duplicating content
-        for i, citation in enumerate(citations[1:], start=2):
+        try:
+            payload = {
+                "model": "sonar-pro",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "Search the web and provide factual information with sources."
+                    },
+                    {
+                        "role": "user",
+                        "content": query
+                    }
+                ]
+            }
+            
+            logger.debug(f"Sending Perplexity API request - query: {query}")
+            response = requests.post(
+                "https://api.perplexity.ai/chat/completions",
+                headers=headers,
+                json=payload
+            )
+            response.raise_for_status()  # Raise exception for bad status codes
+            
+            # Parse the response
+            data = response.json()
+            content = data["choices"][0]["message"]["content"]
+            citations = data.get("citations", ["https://perplexity.ai"])
+            
+            logger.debug(f"Perplexity API response parsed successfully - query: {query}, content_length: {len(content)}, citations_count: {len(citations)}")
+            
+            # Create results list for this query
+            results = []
+            
+            # First citation gets the full content
             results.append({
-                "title": f"Perplexity Search, Source {i}",
-                "url": citation,
-                "content": "See primary source for full content",
-                "raw_content": None,
-                "score": 0.5  # Lower score for secondary sources
+                "title": f"Perplexity Search, Source 1",
+                "url": citations[0],
+                "content": content,
+                "raw_content": content,
+                "score": 1.0  # Adding score to match Tavily format
             })
-        
-        # Format response to match Tavily structure
-        search_docs.append({
-            "query": query,
-            "follow_up_questions": None,
-            "answer": None,
-            "images": [],
-            "results": results
-        })
+            
+            # Add additional citations without duplicating content
+            for i, citation in enumerate(citations[1:], start=2):
+                results.append({
+                    "title": f"Perplexity Search, Source {i}",
+                    "url": citation,
+                    "content": "See primary source for full content",
+                    "raw_content": None,
+                    "score": 0.5  # Lower score for secondary sources
+                })
+            
+            # Format response to match Tavily structure
+            search_docs.append({
+                "query": query,
+                "follow_up_questions": None,
+                "answer": None,
+                "images": [],
+                "results": results
+            })
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Perplexity API request failed - query: {query}, error: {str(e)}, status_code: {getattr(e.response, 'status_code', None)}")
+            # Add empty result to maintain structure consistency
+            search_docs.append({
+                "query": query,
+                "follow_up_questions": None,
+                "answer": None,
+                "images": [],
+                "results": [],
+                "error": str(e)
+            })
+        except Exception as e:
+            logger.error(f"Perplexity search processing exception - query: {query}, error: {str(e)}, error_type: {type(e).__name__}")
+            search_docs.append({
+                "query": query,
+                "follow_up_questions": None,
+                "answer": None,
+                "images": [],
+                "results": [],
+                "error": str(e)
+            })
+    
+    logger.info(f"Perplexity search completed - queries_processed: {len(search_queries)}, successful_queries: {len([doc for doc in search_docs if not doc.get('error')])}, total_results: {sum(len(doc.get('results', [])) for doc in search_docs)}")
+    logger.info(f"Perplexity search results - {search_docs}")
     
     return search_docs
 
@@ -558,7 +661,7 @@ async def exa_search(search_queries, max_characters: Optional[int] = None, num_r
             search_docs.append(result)
         except Exception as e:
             # Handle exceptions gracefully
-            print(f"Error processing query '{query}': {str(e)}")
+            logger.error(f"Exa query processing failed - query: {query}, error: {str(e)}, error_type: {type(e).__name__}")
             # Add a placeholder result for failed queries to maintain index alignment
             search_docs.append({
                 "query": query,
@@ -571,7 +674,7 @@ async def exa_search(search_queries, max_characters: Optional[int] = None, num_r
             
             # Add additional delay if we hit a rate limit error
             if "429" in str(e):
-                print("Rate limit exceeded. Adding additional delay...")
+                logger.warning("Exa API rate limit, adding additional delay")
                 await asyncio.sleep(1.0)  # Add a longer delay if we hit a rate limit
     
     return search_docs
@@ -694,7 +797,7 @@ async def arxiv_search_async(search_queries, load_max_docs=5, get_full_documents
             }
         except Exception as e:
             # Handle exceptions gracefully
-            print(f"Error processing arXiv query '{query}': {str(e)}")
+            logger.error(f"arXiv single query processing failed - query: {query}, error: {str(e)}, error_type: {type(e).__name__}")
             return {
                 'query': query,
                 'follow_up_questions': None,
@@ -716,7 +819,7 @@ async def arxiv_search_async(search_queries, load_max_docs=5, get_full_documents
             search_docs.append(result)
         except Exception as e:
             # Handle exceptions gracefully
-            print(f"Error processing arXiv query '{query}': {str(e)}")
+            logger.error(f"arXiv query main loop processing failed - query: {query}, error: {str(e)}, error_type: {type(e).__name__}")
             search_docs.append({
                 'query': query,
                 'follow_up_questions': None,
@@ -728,7 +831,7 @@ async def arxiv_search_async(search_queries, load_max_docs=5, get_full_documents
             
             # Add additional delay if we hit a rate limit error
             if "429" in str(e) or "Too Many Requests" in str(e):
-                print("ArXiv rate limit exceeded. Adding additional delay...")
+                logger.warning("arXiv API rate limit, adding additional delay")
                 await asyncio.sleep(5.0)  # Add a longer delay if we hit a rate limit
     
     return search_docs
@@ -783,7 +886,7 @@ async def pubmed_search_async(search_queries, top_k_results=5, email=None, api_k
             # Use wrapper.lazy_load instead of load to get better visibility
             docs = await loop.run_in_executor(None, lambda: list(wrapper.lazy_load(query)))
             
-            print(f"Query '{query}' returned {len(docs)} results")
+            logger.debug(f"PubMed query returned results - query: {query}, results_count: {len(docs)}")
             
             results = []
             # Assign decreasing scores based on the order
@@ -828,10 +931,9 @@ async def pubmed_search_async(search_queries, top_k_results=5, email=None, api_k
             }
         except Exception as e:
             # Handle exceptions with more detailed information
-            error_msg = f"Error processing PubMed query '{query}': {str(e)}"
-            print(error_msg)
+            logger.error(f"PubMed single query processing failed - query: {query}, error: {str(e)}, error_type: {type(e).__name__}")
             import traceback
-            print(traceback.format_exc())  # Print full traceback for debugging
+            logger.debug(f"PubMed error details - traceback: {traceback.format_exc()}")
             
             return {
                 'query': query,
@@ -864,8 +966,7 @@ async def pubmed_search_async(search_queries, top_k_results=5, email=None, api_k
             
         except Exception as e:
             # Handle exceptions gracefully
-            error_msg = f"Error in main loop processing PubMed query '{query}': {str(e)}"
-            print(error_msg)
+            logger.error(f"PubMed main loop processing failed - query: {query}, error: {str(e)}, error_type: {type(e).__name__}")
             
             search_docs.append({
                 'query': query,
@@ -941,16 +1042,19 @@ async def google_search_async(search_queries: Union[str, List[str]], max_results
     Returns:
         List[dict]: List of search responses from Google, one per query
     """
-
+    
+    # Handle case where search_queries is a single string
+    if isinstance(search_queries, str):
+        search_queries = [search_queries]
+    
+    logger.info(f"Starting Google search - queries_count: {len(search_queries)}, max_results: {max_results}, include_raw_content: {include_raw_content}, queries: {search_queries[:3]}")  # Only log first 3 queries
 
     # Check for API credentials from environment variables
     api_key = os.environ.get("GOOGLE_API_KEY")
     cx = os.environ.get("GOOGLE_CX")
     use_api = bool(api_key and cx)
     
-    # Handle case where search_queries is a single string
-    if isinstance(search_queries, str):
-        search_queries = [search_queries]
+    logger.info(f"Google search mode determined - use_api: {use_api}, has_api_key: {bool(api_key)}, has_cx: {bool(cx)}")
     
     # Define user agent generator
     def get_useragent():
@@ -987,13 +1091,13 @@ async def google_search_async(search_queries: Union[str, List[str]], max_results
                             'start': start_index,
                             'num': num
                         }
-                        print(f"Requesting {num} results for '{query}' from Google API...")
+                        logger.debug(f"Requesting Google API - query: {query}, num_results: {num}, start_index: {start_index}")
 
                         async with aiohttp.ClientSession() as session:
                             async with session.get('https://www.googleapis.com/customsearch/v1', params=params) as response:
                                 if response.status != 200:
                                     error_text = await response.text()
-                                    print(f"API error: {response.status}, {error_text}")
+                                    logger.error(f"Google API request failed - status_code: {response.status}, error_text: {error_text[:500]}")  # Limit error text length
                                     break
                                     
                                 data = await response.json()
@@ -1020,7 +1124,7 @@ async def google_search_async(search_queries: Union[str, List[str]], max_results
                 else:
                     # Add delay between requests
                     await asyncio.sleep(0.5 + random.random() * 1.5)
-                    print(f"Scraping Google for '{query}'...")
+                    logger.debug(f"Starting Google web scraping - query: {query}")
 
                     # Define scraping function
                     def google_search(query, max_results):
@@ -1098,7 +1202,7 @@ async def google_search_async(search_queries: Union[str, List[str]], max_results
                             return search_results
                                 
                         except Exception as e:
-                            print(f"Error in Google search for '{query}': {str(e)}")
+                            logger.error(f"Google web scraping failed - query: {query}, error: {str(e)}, error_type: {type(e).__name__}")
                             return []
                     
                     # Execute search in thread pool
@@ -1111,52 +1215,85 @@ async def google_search_async(search_queries: Union[str, List[str]], max_results
                     # Process the results
                     results = search_results
                 
-                # If requested, fetch full page content asynchronously (for both API and web scraping)
-                if include_raw_content and results:
-                    content_semaphore = asyncio.Semaphore(3)
-                    
-                    async with aiohttp.ClientSession() as session:
-                        fetch_tasks = []
+                logger.info(f"Google search completed - results: {results}")
+                
+                # Use smart content fetching to optimize data retrieval process
+                if include_raw_content and results and PLAYWRIGHT_UTILS_AVAILABLE:
+                    try:
+                        logger.info(f"Starting smart content fetching - results_count: {len(results)}, query: {query}")
                         
-                        async def fetch_full_content(result):
-                            async with content_semaphore:
+                        # Extract all URLs that need content fetching
+                        urls_to_fetch = [result['url'] for result in results if result.get('url')]
+                        
+                        if urls_to_fetch:
+                            logger.debug(f"[Playwright]Preparing smart content fetching - urls_count: {len(urls_to_fetch)}, urls: {urls_to_fetch[:5]}")
+                            
+                            # Use smart content fetching
+                            # Specify domains that need special handling (social media, dynamic websites, etc.)
+                            special_domains = ['x.com', 'twitter.com', 'linkedin.com', 'facebook.com', 'instagram.com']
+                            
+                            # Fetch content
+                            fetch_results = await smart_content_fetch(
+                                urls=urls_to_fetch,
+                                use_playwright_for=special_domains,
+                                fallback_to_playwright=True  # Fallback to Playwright on failure
+                            )
+                            logger.info(f"[Playwright]Smart content fetching completed - fetch_results: {fetch_results}")
+                            
+                            # Map fetched content back to original results
+                            url_to_content = {
+                                fetch_result['original_url']: fetch_result 
+                                for fetch_result in fetch_results
+                            }
+                            logger.info(f"[Playwright]url_to_content: {url_to_content}")
+                            
+                            # Update search results
+                            success_count = 0
+                            failed_count = 0
+                            for result in results:
                                 url = result['url']
-                                headers = {
-                                    'User-Agent': get_useragent(),
-                                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
-                                }
-                                
-                                try:
-                                    await asyncio.sleep(0.2 + random.random() * 0.6)
-                                    async with session.get(url, headers=headers, timeout=10) as response:
-                                        if response.status == 200:
-                                            # Check content type to handle binary files
-                                            content_type = response.headers.get('Content-Type', '').lower()
-                                            
-                                            # Handle PDFs and other binary files
-                                            if 'application/pdf' in content_type or 'application/octet-stream' in content_type:
-                                                # For PDFs, indicate that content is binary and not parsed
-                                                result['raw_content'] = f"[Binary content: {content_type}. Content extraction not supported for this file type.]"
-                                            else:
-                                                try:
-                                                    # Try to decode as UTF-8 with replacements for non-UTF8 characters
-                                                    html = await response.text(errors='replace')
-                                                    soup = BeautifulSoup(html, 'html.parser')
-                                                    result['raw_content'] = soup.get_text()
-                                                except UnicodeDecodeError as ude:
-                                                    # Fallback if we still have decoding issues
-                                                    result['raw_content'] = f"[Could not decode content: {str(ude)}]"
-                                except Exception as e:
-                                    print(f"Warning: Failed to fetch content for {url}: {str(e)}")
-                                    result['raw_content'] = f"[Error fetching content: {str(e)}]"
-                                return result
-                        
+                                if url in url_to_content:
+                                    fetch_result = url_to_content[url]
+                                    logger.info(f"[loop] result: {result} \n url: {url}, \n url_to_content: {url_to_content}, \n fetch_result: {fetch_result} \n")
+                                    if fetch_result['success']:
+                                        # Successfully fetched content
+                                        result['raw_content'] = fetch_result['content']
+                                        
+                                        # If title is empty, use fetched title
+                                        if not result.get('title') and fetch_result.get('title'):
+                                            result['title'] = fetch_result['title']
+                                        
+                                        # Add fetch method information
+                                        result['fetch_method'] = fetch_result.get('method', 'unknown')
+                                        result['fetch_status'] = fetch_result.get('status')
+                                        success_count += 1
+                                        
+                                    else:
+                                        # Fetch failed, use error information
+                                        error_msg = fetch_result.get('error', 'Unknown error')
+                                        result['raw_content'] = f"[Smart fetch failed: {error_msg}]"
+                                        result['fetch_method'] = 'failed'
+                                        result['fetch_error'] = error_msg
+                                        failed_count += 1
+                                        logger.debug(f"Content fetch failed - url: {url}, error: {error_msg}")
+                                else:
+                                    # URL not in mapping, keep original content
+                                    result['raw_content'] = result.get('content', '')
+                                    failed_count += 1
+                            
+                            logger.info(f"Smart content fetching completed - success_count: {success_count}, failed_count: {failed_count}, total_processed: {len(results)}")
+                    
+                    except Exception as e:
+                        logger.error(f"Smart content fetching exception - error: {str(e)}, error_type: {type(e).__name__}, query: {query}")
+                        # Fallback: keep original content as raw_content
                         for result in results:
-                            fetch_tasks.append(fetch_full_content(result))
-                        
-                        updated_results = await asyncio.gather(*fetch_tasks)
-                        results = updated_results
-                        print(f"Fetched full content for {len(results)} results")
+                            result['raw_content'] = result.get('content', '')
+                
+                elif include_raw_content and results and not PLAYWRIGHT_UTILS_AVAILABLE:
+                    logger.warning("playwright_utils not available, using basic content fetching")
+                    # Fallback to simple content copying
+                    for result in results:
+                        result['raw_content'] = result.get('content', '')
                 
                 return {
                     "query": query,
@@ -1166,13 +1303,14 @@ async def google_search_async(search_queries: Union[str, List[str]], max_results
                     "results": results
                 }
             except Exception as e:
-                print(f"Error in Google search for query '{query}': {str(e)}")
+                logger.error(f"Google search query failed - query: {query}, error: {str(e)}, error_type: {type(e).__name__}")
                 return {
                     "query": query,
                     "follow_up_questions": None,
                     "answer": None,
                     "images": [],
-                    "results": []
+                    "results": [],
+                    "error": str(e)
                 }
     
     try:
@@ -1191,29 +1329,29 @@ async def google_search_async(search_queries: Union[str, List[str]], max_results
 @traceable
 async def gemini_google_search_async(search_queries: Union[str, List[str]], max_results: int = 5, include_raw_content: bool = True):
     """
-    使用 Gemini 进行增强搜索（结合 Google 搜索和 AI 分析）
+    Enhanced search using Gemini (combining Google Search and AI analysis)
     
     Args:
-        search_queries (Union[str, List[str]]): 搜索查询列表
-        max_results (int): 每个查询返回的最大结果数
-        include_raw_content (bool): 是否包含原始内容
+        search_queries (Union[str, List[str]]): List of search queries
+        max_results (int): Maximum number of results to return per query
+        include_raw_content (bool): Whether to include raw content
         
     Returns:
-        List[dict]: 格式化的搜索结果列表
+        List[dict]: List of formatted search results
     """
-    # 确保 search_queries 是列表格式
+    # Ensure search_queries is in list format
     if isinstance(search_queries, str):
         search_queries = [search_queries]
     
-    # 首先使用常规 Google 搜索获取结果
+    # First use regular Google search to get results
     search_results = await google_search_async(search_queries, max_results, include_raw_content)
     
-    # 检查是否有 Gemini API Key 用于增强分析
+    # Check if Gemini API Key is available for enhanced analysis
     if not os.environ.get("GEMINI_API_KEY"):
-        print("⚠️  未设置 GEMINI_API_KEY，使用常规 Google 搜索结果")
+        logger.warning("GEMINI_API_KEY not set, using regular Google search results")
         return search_results
     
-    # 使用 Gemini 对搜索结果进行增强分析
+    # Use Gemini for enhanced analysis of search results
     try:
         gemini_model = ChatGoogleGenerativeAI(
             model="gemini-2.5-flash-lite-preview-06-17",
@@ -1226,32 +1364,32 @@ async def gemini_google_search_async(search_queries: Union[str, List[str]], max_
         for result in search_results:
             query = result['query']
             
-            # 构建分析提示
+            # Build analysis prompt
             sources_summary = "\n".join([
-                f"标题: {item['title']}\nURL: {item['url']}\n内容: {item['content'][:300]}...\n"
-                for item in result['results'][:3]  # 只分析前3个结果
+                f"Title: {item['title']}\nURL: {item['url']}\nContent: {item['content'][:300]}...\n"
+                for item in result['results'][:3]  # Only analyze first 3 results
             ])
             
             analysis_prompt = f"""
-            基于以下搜索结果，为查询 "{query}" 提供一个综合性的分析和总结：
+            Based on the following search results, provide a comprehensive analysis and summary for the query "{query}":
 
-            搜索结果：
+            Search Results:
             {sources_summary}
 
-            请提供：
-            1. 对查询主题的简洁总结（2-3句话）
-            2. 关键发现和重要信息
-            3. 可能的后续问题或相关主题
+            Please provide:
+            1. A concise summary of the query topic (2-3 sentences)
+            2. Key findings and important information
+            3. Possible follow-up questions or related topics
 
-            当前日期：{datetime.datetime.now().strftime('%Y-%m-%d')}
+            Current date: {datetime.datetime.now().strftime('%Y-%m-%d')}
             """
             
             try:
-                # 调用 Gemini 进行分析
+                # Call Gemini for analysis
                 response = await gemini_model.ainvoke(analysis_prompt)
                 ai_analysis = response.content if hasattr(response, 'content') else str(response)
                 
-                # 增强原始结果
+                # Enhance original results
                 enhanced_result = {
                     **result,
                     "answer": ai_analysis,
@@ -1259,29 +1397,29 @@ async def gemini_google_search_async(search_queries: Union[str, List[str]], max_
                 }
                 enhanced_results.append(enhanced_result)
                 
-                # 添加延迟避免速率限制
+                # Add delay to avoid rate limiting
                 await asyncio.sleep(0.5)
                 
             except Exception as e:
-                print(f"Gemini 分析失败 for query '{query}': {str(e)}")
-                # 如果 Gemini 分析失败，返回原始结果
+                logger.error(f"Gemini analysis failed - query: {query}, error: {str(e)}, error_type: {type(e).__name__}")
+                # If Gemini analysis fails, return original results
                 enhanced_results.append(result)
         
         return enhanced_results
         
     except Exception as e:
-        print(f"Gemini Google Search 初始化错误: {str(e)}")
-        # 如果 Gemini 不可用，返回常规搜索结果
+        logger.error(f"Gemini Google Search initialization error - error: {str(e)}, error_type: {type(e).__name__}")
+        # If Gemini is unavailable, return regular search results
         return search_results
 
 async def scrape_pages(titles: List[str], urls: List[str]) -> str:
     """
-    Scrapes content from a list of URLs and formats it into a readable markdown document.
+    Scrape page content using smart content fetching technology and format as readable documents.
     
     This function:
     1. Takes a list of page titles and URLs
-    2. Makes asynchronous HTTP requests to each URL
-    3. Converts HTML content to markdown
+    2. Uses smart content fetching (Playwright for complex sites, HTTP for simple ones)
+    3. Converts HTML content to clean text
     4. Formats all content with clear source attribution
     
     Args:
@@ -1289,9 +1427,71 @@ async def scrape_pages(titles: List[str], urls: List[str]) -> str:
         urls (List[str]): A list of URLs to scrape content from
         
     Returns:
-        str: A formatted string containing the full content of each page in markdown format,
+        str: A formatted string containing the full content of each page,
              with clear section dividers and source attribution
     """
+    
+    logger.info(f"Starting page content scraping - pages_count: {len(urls)}, urls: {urls[:5]}")
+    
+    # 🚀 Use smart content fetching instead of traditional httpx method
+    if PLAYWRIGHT_UTILS_AVAILABLE:
+        try:
+            logger.info(f"Using smart content fetching for pages - pages_count: {len(urls)}, playwright_available: True")
+            
+            # Specify domains that need special handling
+            special_domains = ['x.com', 'twitter.com', 'linkedin.com', 'facebook.com', 'instagram.com', 'youtube.com']
+            
+            # Use smart content fetching
+            fetch_results = await smart_content_fetch(
+                urls=urls,
+                use_playwright_for=special_domains,
+                fallback_to_playwright=True
+            )
+            
+            # Create formatted output
+            formatted_output = "Search results: \n\n"
+            
+            success_count = 0
+            failure_count = 0
+            
+            for i, (title, url, fetch_result) in enumerate(zip(titles, urls, fetch_results)):
+                formatted_output += f"\n\n--- SOURCE {i+1}: {title} ---\n"
+                formatted_output += f"URL: {url}\n"
+                formatted_output += f"Fetch method: {fetch_result.get('method', 'unknown')}\n"
+                
+                if fetch_result['success']:
+                    # Successfully fetched content
+                    content = fetch_result['content']
+                    original_length = len(content)
+                    
+                    # If content is too long, truncate appropriately
+                    if len(content) > 50000:  # 50KB limit
+                        content = content[:50000] + "\n\n[Content truncated...]"
+                        logger.debug(f"Content truncated - url: {url}, original_length: {original_length}, truncated_length: {len(content)}")
+                    
+                    formatted_output += f"Status: ✅ Successfully fetched\n\n"
+                    formatted_output += f"FULL CONTENT:\n{content}"
+                    success_count += 1
+                else:
+                    # Fetch failed
+                    error_msg = fetch_result.get('error', 'Unknown error')
+                    formatted_output += f"Status: ❌ Fetch failed ({error_msg})\n\n"
+                    formatted_output += f"CONTENT: [Unable to fetch content: {error_msg}]"
+                    failure_count += 1
+                    logger.debug(f"Page content fetch failed - url: {url}, error: {error_msg}")
+                
+                formatted_output += "\n\n" + "-" * 80 + "\n"
+            
+            logger.info(f"Smart content fetching completed - total_pages: {len(urls)}, success_count: {success_count}, failure_count: {failure_count}")
+            
+            return formatted_output
+            
+        except Exception as e:
+            logger.error(f"Smart content fetching failed, falling back to traditional method - error: {str(e)}, error_type: {type(e).__name__}")
+            # Fall back to traditional method
+    
+    # 🔄 Fall back to traditional httpx method
+    logger.info(f"Using traditional HTTP client for pages - pages_count: {len(urls)}, playwright_available: {PLAYWRIGHT_UTILS_AVAILABLE}")
     
     # Create an async HTTP client
     async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
@@ -1330,7 +1530,7 @@ async def scrape_pages(titles: List[str], urls: List[str]) -> str:
             formatted_output += f"URL: {url}\n\n"
             formatted_output += f"FULL CONTENT:\n {page}"
             formatted_output += "\n\n" + "-" * 80 + "\n"
-        
+    
     return formatted_output
 
 @tool
@@ -1594,27 +1794,27 @@ async def gemini_google_search(
     config: RunnableConfig = None
 ) -> str:
     """
-    使用 Gemini 原生 Google Search 工具进行搜索
+    Search using Gemini native Google Search tool
     
     Args:
-        queries (List[str]): 搜索查询列表
-        max_results (int): 最大结果数
-        config: 运行配置
+        queries (List[str]): List of search queries
+        max_results (int): Maximum number of results
+        config: Runtime configuration
         
     Returns:
-        str: 格式化的搜索结果字符串
+        str: Formatted search results string
     """
-    # 使用 gemini_google_search_async 进行搜索
+    # Use gemini_google_search_async to perform search
     search_results = await gemini_google_search_async(
         queries,
         max_results=max_results,
         include_raw_content=True
     )
     
-    # 格式化输出
+    # Format output
     formatted_output = "Google Search Results (via Gemini):\n\n"
     
-    # 去重并格式化结果
+    # Deduplicate and format results
     unique_results = {}
     for response in search_results:
         for result in response['results']:
@@ -1622,16 +1822,16 @@ async def gemini_google_search(
             if url not in unique_results:
                 unique_results[url] = {**result, "query": response['query']}
     
-    # 处理搜索结果
+    # Process search results
     async def noop():
         return None
     
-    # 如果配置了结果处理，应用相应的处理方式
+    # If result processing is configured, apply appropriate processing method
     configurable = Configuration.from_runnable_config(config) if config else None
     max_char_to_include = 30_000
     
     if configurable and configurable.process_search_results == "summarize":
-        # 使用摘要模式处理结果
+        # Use summary mode to process results
         if configurable.summarization_model_provider == "anthropic":
             extra_kwargs = {"betas": ["extended-cache-ttl-2025-04-11"]}
         else:
@@ -1653,7 +1853,7 @@ async def gemini_google_search(
             for url, result, summary in zip(unique_results.keys(), unique_results.values(), summaries)
         }
     
-    # 格式化最终输出
+    # Format final output
     for i, (url, result) in enumerate(unique_results.items()):
         formatted_output += f"\n\n--- SOURCE {i+1}: {result['title']} ---\n"
         formatted_output += f"URL: {url}\n\n"
@@ -1668,13 +1868,14 @@ async def gemini_google_search(
         return "No valid search results found using Gemini Google Search. Please try different search queries."
 
 
-async def select_and_execute_search(search_api: str, query_list: list[str], params_to_pass: dict) -> str:
-    """Select and execute the appropriate search API.
+async def select_and_execute_search(search_api: str, query_list: list[str], params_to_pass: dict, enable_playwright_optimization: bool = True) -> str:
+    """Select and execute the appropriate search API with optional Playwright optimization.
     
     Args:
         search_api: Name of the search API to use
         query_list: List of search queries to execute
         params_to_pass: Parameters to pass to the search API
+        enable_playwright_optimization: Whether to enable Playwright optimization for raw search results
         
     Returns:
         Formatted string containing search results
@@ -1682,33 +1883,127 @@ async def select_and_execute_search(search_api: str, query_list: list[str], para
     Raises:
         ValueError: If an unsupported search API is specified
     """
-    if search_api == "tavily":
-        # Tavily search tool used with both workflow and agent 
-        # and returns a formatted source string
-        return await tavily_search.ainvoke({'queries': query_list, **params_to_pass})
-    elif search_api == "duckduckgo":
-        # DuckDuckGo search tool used with both workflow and agent 
-        return await duckduckgo_search.ainvoke({'search_queries': query_list})
-    elif search_api == "perplexity":
-        search_results = perplexity_search(query_list, **params_to_pass)
-    elif search_api == "exa":
-        search_results = await exa_search(query_list, **params_to_pass)
-    elif search_api == "arxiv":
-        search_results = await arxiv_search_async(query_list, **params_to_pass)
-    elif search_api == "pubmed":
-        search_results = await pubmed_search_async(query_list, **params_to_pass)
-    elif search_api == "linkup":
-        search_results = await linkup_search(query_list, **params_to_pass)
-    elif search_api == "googlesearch":
-        search_results = await google_search_async(query_list, **params_to_pass)
-    elif search_api == "azureaisearch":
-        search_results = await azureaisearch_search_async(query_list, **params_to_pass)
-    elif search_api == "geminigooglesearch":
-        search_results = await gemini_google_search_async(query_list, **params_to_pass)
-    else:
-        raise ValueError(f"Unsupported search API: {search_api}")
+    logger.info(f"Starting search execution - search_api: {search_api}, query_count: {len(query_list)}, queries: {query_list[:3]}, params: {params_to_pass}, enable_playwright_optimization: {enable_playwright_optimization}")
+    
+    # Disable Playwright optimization by default on Windows due to subprocess compatibility issues
+    current_platform = platform.system()
+    if current_platform == "Windows" and enable_playwright_optimization:
+        logger.warning(f"Windows environment detected, automatically disabling Playwright optimization due to asyncio subprocess compatibility issues - platform: {current_platform}")
+        enable_playwright_optimization = False
+    
+    try:
+        if search_api == "tavily":
+            logger.debug("Using Tavily search")
+            # Tavily search tool used with both workflow and agent 
+            # and returns a formatted source string
+            search_results = await tavily_search.ainvoke({'queries': query_list, **params_to_pass})
+            logger.info(f"Tavily search completed - result_length: {len(search_results)}")
+            logger.info(f"Tavily search results: {search_results}")
+            # return result
+        elif search_api == "duckduckgo":
+            logger.debug("Using DuckDuckGo search")
+            # DuckDuckGo search tool used with both workflow and agent 
+            search_results = await duckduckgo_search.ainvoke({'search_queries': query_list})
+            logger.info(f"DuckDuckGo search completed - result_length: {len(search_results)}")
+            logger.info(f"DuckDuckGo search results: {search_results}")
+            # return result
+        elif search_api == "perplexity":
+            logger.debug("Using Perplexity search")
+            search_results = perplexity_search(query_list, **params_to_pass)
+            logger.info(f"Perplexity search completed - result_length: {len(search_results)}")
+            logger.info(f"Perplexity search results: {search_results}")
+        elif search_api == "exa":
+            logger.debug("Using Exa search")
+            search_results = await exa_search(query_list, **params_to_pass)
+            logger.info(f"Exa search completed - result_length: {len(search_results)}")
+            logger.info(f"Exa search results: {search_results}")
+        elif search_api == "arxiv":
+            logger.debug("Using arXiv search")
+            search_results = await arxiv_search_async(query_list, **params_to_pass)
+            logger.info(f"arXiv search completed - result_length: {len(search_results)}")
+            logger.info(f"arXiv search results: {search_results}")
+        elif search_api == "pubmed":
+            logger.debug("Using PubMed search")
+            search_results = await pubmed_search_async(query_list, **params_to_pass)
+            logger.info(f"PubMed search completed - result_length: {len(search_results)}")
+            logger.info(f"PubMed search results: {search_results}")
+        elif search_api == "linkup":
+            logger.debug("Using Linkup search")
+            search_results = await linkup_search(query_list, **params_to_pass)
+            logger.info(f"Linkup search completed - result_length: {len(search_results)}")
+            logger.info(f"Linkup search results: {search_results}")
+        elif search_api == "googlesearch":
+            logger.debug("Using Google search")
+            search_results = await google_search_async(query_list, **params_to_pass)
+            logger.info(f"Google search completed - result_length: {len(search_results)}")
+            logger.info(f"Google search results: {search_results}")
+        elif search_api == "azureaisearch":
+            logger.debug("Using Azure AI search")
+            search_results = await azureaisearch_search(query_list, **params_to_pass)
+            logger.info(f"Azure AI search completed - result_length: {len(search_results)}")
+            logger.info(f"Azure AI search results: {search_results}")
+        elif search_api == "geminigooglesearch":
+            logger.debug("Using Gemini Google search")
+            search_results = await gemini_google_search_async(query_list, **params_to_pass)
+            logger.info(f"Gemini Google search completed - result_length: {len(search_results)}")
+            logger.info(f"Gemini Google search results: {search_results}")
+        else:
+            logger.error(f"Unsupported search API - search_api: {search_api}")
+            raise ValueError(f"Unsupported search API: {search_api}")
+    
+        # logger.info(f"Search completed - search_api: {search_api}, result_length: {len(search_results) if search_results else 0}")
+        # logger.info(f"Search results: {search_results}")
+    except Exception as e:
+        logger.error(f"Search API call failed - search_api: {search_api}, error: {str(e)}, error_type: {type(e).__name__}")
+        raise
 
-    return deduplicate_and_format_sources(search_results, max_tokens_per_source=4000, deduplication_strategy="keep_first")
+    # 🚀 Optional Playwright optimization step
+    if enable_playwright_optimization and PLAYWRIGHT_UTILS_AVAILABLE:
+        try:
+            logger.info("Starting Playwright optimization")
+            
+            # Collect all search results for optimization
+            all_results = []
+            for result in search_results:
+                if isinstance(result, dict) and 'results' in result:
+                    all_results.extend(result['results'])
+            
+            if all_results:
+                logger.info(f"Preparing Playwright optimization - results_count: {len(all_results)}")
+                
+                # Apply Playwright optimization
+                optimized_results = await optimize_search_results_with_playwright(
+                    all_results,
+                    max_concurrent=3,
+                    content_char_limit=50000
+                )
+                
+                # Show optimization summary
+                summary = get_enhanced_search_summary(optimized_results)
+                logger.info(f"Playwright optimization summary - summary: {summary}")
+                
+                # Map optimized results back to original structure
+                optimized_map = {res['url']: res for res in optimized_results}
+                mapped_count = 0
+                for result in search_results:
+                    if isinstance(result, dict) and 'results' in result:
+                        for i, res in enumerate(result['results']):
+                            if res['url'] in optimized_map:
+                                result['results'][i] = optimized_map[res['url']]
+                                mapped_count += 1
+                
+                logger.info(f"Playwright optimization completed - total_results: {len(all_results)}, optimized_results: {len(optimized_results)}, mapped_results: {mapped_count}")
+            else:
+                logger.debug("No search results to optimize")
+        
+        except Exception as e:
+            logger.error(f"Playwright optimization failed - error: {str(e)}, error_type: {type(e).__name__}")
+    elif not enable_playwright_optimization:
+        logger.debug("Playwright optimization disabled")
+    elif not PLAYWRIGHT_UTILS_AVAILABLE:
+        logger.warning("Playwright tool not available, skipping optimization")
+
+    return deduplicate_and_format_sources(search_results, max_tokens_per_source=10000, deduplication_strategy="keep_first")
 
 
 class Summary(BaseModel):
@@ -1807,3 +2102,292 @@ async def load_mcp_server_config(path: str) -> dict:
 
     config = await asyncio.to_thread(_load)
     return config
+
+async def intelligent_search_web_unified(
+    queries: List[str],
+    config: RunnableConfig,
+    search_api: str = "tavily",
+    search_params: Optional[Dict[str, Any]] = None
+) -> str:
+    """
+    Unified intelligent search interface
+    
+    Decides whether to use intelligent research mode or traditional search based on configuration
+    
+    Args:
+        queries: List of search queries
+        config: Runtime configuration
+        search_api: Search API type
+        search_params: Search parameters
+        
+    Returns:
+        Search results string
+    """
+    logger.info(f"Starting unified intelligent search - queries_count: {len(queries)}, search_api: {search_api}, queries: {queries[:3]}")  # Only log first 3 queries
+    
+    try:
+        # Get research mode configuration
+        research_mode = "simple"  # Default value
+        
+        # Try to get research_mode and iteration count from configuration
+        configurable = config.get("configurable", {})
+        if isinstance(configurable, dict):
+            research_mode = configurable.get("research_mode", "simple")
+            max_iterations = configurable.get("max_research_iterations", 3)
+        else:
+            max_iterations = 3
+        
+        logger.debug(f"Search configuration parsed - research_mode: {research_mode}, max_iterations: {max_iterations}, search_params: {search_params}")
+        
+        # If intelligent mode is enabled, use intelligent research manager
+        if research_mode and research_mode != "simple":
+            try:
+                logger.info(f"Enabling intelligent research mode - research_mode: {research_mode}")
+                
+                from open_deep_research.intelligent_research import (
+                    IntelligentResearchManager,
+                    ResearchMode
+                )
+                
+                # Create intelligent research manager
+                manager = IntelligentResearchManager()
+                
+                # Parse research mode
+                try:
+                    mode = ResearchMode(research_mode)
+                    logger.debug(f"Research mode parsed successfully - mode: {mode.value}")
+                except ValueError:
+                    mode = ResearchMode.REFLECTIVE  # Default reflective mode
+                    logger.warning(f"Research mode parsing failed, using default mode - original_mode: {research_mode}, default_mode: {mode.value}")
+                
+                logger.info(f"Starting intelligent research execution - query: {queries[0] if queries else ''}, mode: {mode.value}, max_iterations: {max_iterations}")
+                
+                # Execute intelligent research
+                result = await manager.conduct_research(
+                    query=queries[0] if queries else "",
+                    config=config,
+                    mode=mode,
+                    max_iterations=max_iterations
+                )
+                
+                # Format intelligent research results
+                if "error" not in result:
+                    logger.info(f"Intelligent research executed successfully - iterations: {result.get('iterations', 0)}")
+                    
+                    # 🔥 First choice: directly return final report/answer from intelligent research
+                    if "final_report" in result:
+                        logger.info(f"Returning intelligent research final report - report_length: {len(result['final_report'])}")
+                        return result["final_report"]
+                    
+                    if "answer" in result:
+                        logger.info(f"Returning intelligent research answer - answer_length: {len(result['answer'])}")
+                        return result["answer"]
+                    
+                    # 🔍 Second choice: if search results exist, format output
+                    if "search_results" in result and result["search_results"]:
+                        logger.info(f"Formatting intelligent research search results - results_count: {len(result['search_results'])}")
+                        formatted_results = []
+                        for i, res in enumerate(result["search_results"][:10], 1):
+                            if isinstance(res, dict):
+                                title = res.get("title", "No title")
+                                content = res.get("content", res.get("snippet", ""))
+                                url = res.get("url", "")
+                                formatted_results.append(f"{i}. **{title}**\n{content[:500]}...\nURL: {url}\n")
+                        
+                        if formatted_results:
+                            logger.debug(f"Intelligent research results formatting completed - formatted_count: {len(formatted_results)}")
+                            return "\n".join(formatted_results)
+                    
+                    # 🔄 Last fallback: use enhanced queries for traditional search only when traditional search API is available
+                    if search_api != "none":
+                        enhanced_queries = result.get("queries", queries)
+                        logger.info(f"Using enhanced queries for traditional search - enhanced_queries_count: {len(enhanced_queries)}, enhanced_queries: {enhanced_queries[:3]}")
+                        return await select_and_execute_search(search_api, enhanced_queries, search_params or {})
+                    else:
+                        # If it's none API, return basic results from intelligent research
+                        queries_count = len(result.get("queries", []))
+                        logger.info(f"Intelligent research completed (no additional search needed) - generated_queries_count: {queries_count}")
+                        return f"Intelligent research completed, generated {queries_count} enhanced queries:\n" + \
+                               "\n".join(f"- {q}" for q in result.get("queries", []))
+                else:
+                    error_msg = result.get('error', 'Unknown error')
+                    logger.warning(f"Intelligent research failed, falling back to traditional search - error: {error_msg}")
+                    
+            except ImportError as e:
+                logger.warning(f"Intelligent research module import failed, falling back to traditional search - import_error: {str(e)}")
+            except Exception as e:
+                logger.error(f"Intelligent research execution failed, falling back to traditional search - error: {str(e)}, error_type: {type(e).__name__}")
+        
+        # Use traditional search as fallback
+        logger.info(f"Using traditional search mode - search_api: {search_api}")
+        
+        # Check if Playwright optimization is enabled
+        enable_optimization = search_params and search_params.get('enable_playwright_optimization', True)
+        logger.info(f"Playwright optimization setting - enable_optimization: {enable_optimization}")
+        
+        result = await select_and_execute_search(
+            search_api, 
+            queries, 
+            search_params or {}, 
+            enable_playwright_optimization=enable_optimization
+        )
+        
+        logger.info(f"Unified intelligent search completed - search_api: {search_api}, result_length: {len(result) if result else 0}")
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Search execution failed - error: {str(e)}, error_type: {type(e).__name__}, search_api: {search_api}, queries_count: {len(queries)}")
+        # Final fallback: return empty result
+        return f"Search failed: {str(e)}"
+
+async def optimize_search_results_with_playwright(
+    search_results: List[Dict[str, Any]], 
+    max_concurrent: int = 3,
+    content_char_limit: int = 50000
+) -> List[Dict[str, Any]]:
+    """
+    Optimize search results using Playwright intelligent content fetching
+    
+    Args:
+        search_results: List of search results, each containing 'url', 'title', 'content' and other fields
+        max_concurrent: Maximum number of concurrent fetches
+        content_char_limit: Character limit for content
+        
+    Returns:
+        List of optimized search results
+    """
+    if not PLAYWRIGHT_UTILS_AVAILABLE:
+        logger.warning("playwright_utils not available, returning original search results")
+        return search_results
+    
+    try:
+        logger.info(f"Starting search results optimization - results_count: {len(search_results)}")
+        
+        # Extract URLs that need content fetching
+        urls_to_fetch = []
+        url_to_result_map = {}
+        
+        for result in search_results:
+            url = result.get('url')
+            if url:
+                urls_to_fetch.append(url)
+                url_to_result_map[url] = result
+        
+        if not urls_to_fetch:
+            logger.debug(f"No URLs found for content fetching: {urls_to_fetch}")
+            return search_results
+        
+        # Specify domains that need special handling
+        special_domains = [
+            'x.com', 'twitter.com', 
+            'linkedin.com', 'facebook.com', 'instagram.com',
+            'youtube.com', 'reddit.com', 'tiktok.com'
+        ]
+        
+        # Use smart content fetching
+        fetch_results = await smart_content_fetch(
+            urls=urls_to_fetch,
+            use_playwright_for=special_domains,
+            fallback_to_playwright=True
+        )
+        
+        # Count fetch results
+        success_count = 0
+        failure_count = 0
+        
+        # Update search results
+        for fetch_result in fetch_results:
+            original_url = fetch_result.get('original_url')
+            if original_url in url_to_result_map:
+                result = url_to_result_map[original_url]
+                
+                if fetch_result['success']:
+                    # Successfully fetched content
+                    content = fetch_result['content']
+                    
+                    # Content length limit
+                    if len(content) > content_char_limit:
+                        content = content[:content_char_limit] + "\n\n[Content truncated...]"
+                    
+                    # Update results
+                    result['raw_content'] = content
+                    result['enhanced_content'] = content  # Enhanced content
+                    
+                    # If original title is empty or too short, use fetched title
+                    if (not result.get('title') or len(result.get('title', '')) < 10) and fetch_result.get('title'):
+                        result['title'] = fetch_result['title']
+                    
+                    # Add fetch metadata
+                    result['fetch_method'] = fetch_result.get('method', 'unknown')
+                    result['fetch_status'] = fetch_result.get('status')
+                    result['content_enhanced'] = True
+                    
+                    success_count += 1
+                    
+                else:
+                    # Fetch failed
+                    error_msg = fetch_result.get('error', 'Unknown error')
+                    result['raw_content'] = result.get('content', '')  # Keep original content
+                    result['fetch_method'] = 'failed'
+                    result['fetch_error'] = error_msg
+                    result['content_enhanced'] = False
+                    
+                    failure_count += 1
+        
+        logger.info(f"Search results optimization completed - success_count: {success_count}, failure_count: {failure_count}")
+        return search_results
+        
+    except Exception as e:
+        logger.error(f"Search results optimization failed - error: {str(e)}, error_type: {type(e).__name__}")
+        # Return original results, but mark as not enhanced
+        for result in search_results:
+            result['content_enhanced'] = False
+            result['raw_content'] = result.get('content', '')
+        return search_results
+
+def get_enhanced_search_summary(search_results: List[Dict[str, Any]]) -> str:
+    """
+    Get summary information of enhanced search results
+    
+    Args:
+        search_results: List of search results
+        
+    Returns:
+        Summary information string
+    """
+    if not search_results:
+        return "No search results"
+    
+    total_results = len(search_results)
+    enhanced_count = sum(1 for r in search_results if r.get('content_enhanced', False))
+    
+    # Count fetch methods
+    methods = {}
+    for result in search_results:
+        method = result.get('fetch_method', 'unknown')
+        methods[method] = methods.get(method, 0) + 1
+    
+    method_summary = ", ".join([f"{method}: {count}" for method, count in methods.items()])
+    
+    return f"📊 Search Results Summary: Total {total_results} results, {enhanced_count} content enhanced successfully\n" \
+           f"🔧 Fetch Methods Distribution: {method_summary}"
+           
+def extract_json_from_markdown(self, content: str) -> str:
+    """Extract JSON string from Markdown formatted response"""
+    # Match content between ```json and ```
+    json_pattern = r'```json\s*\n(.*?)\n```'
+    match = re.search(json_pattern, content, re.DOTALL)
+    
+    if match:
+        return match.group(1).strip()
+    
+    # If no ```json format found, try to match any ``` code block
+    code_block_pattern = r'```.*?\n(.*?)\n```'
+    match = re.search(code_block_pattern, content, re.DOTALL)
+    
+    if match:
+        return match.group(1).strip()
+    
+    # If none found, return original content
+    return content.strip()

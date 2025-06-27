@@ -36,7 +36,8 @@ from open_deep_research.utils import (
     get_config_value, 
     get_search_params, 
     select_and_execute_search,
-    get_today_str
+    get_today_str,
+    intelligent_search_web_unified
 )
 
 ## Nodes
@@ -94,7 +95,16 @@ async def generate_report_plan(state: ReportState, config: RunnableConfig) -> Co
                                      HumanMessage(content="Generate search queries that will help with planning the sections of the report.")])
     
     query_list = [query.search_query for query in results.queries]
-    source_str = await select_and_execute_search(search_api, query_list, params_to_pass)
+    
+    # 🧠 智能搜索集成：检查是否启用智能研究模式
+    research_mode = get_config_value(configurable.research_mode, "simple")
+    
+    if research_mode and research_mode != "simple":
+        print(f"🧠 Workflow报告规划启用智能研究模式: {research_mode}")
+        source_str = await intelligent_search_web_unified(query_list, config, search_api, params_to_pass)
+    else:
+        # 使用传统搜索
+        source_str = await select_and_execute_search(search_api, query_list, params_to_pass)
     system_instructions_sections = report_planner_instructions.format(messages=get_buffer_string(messages), report_organization=report_structure, context=source_str, feedback=feedback)
 
     planner_provider = get_config_value(configurable.planner_provider)
@@ -185,7 +195,16 @@ async def search_web(state: SectionState, config: RunnableConfig):
     params_to_pass = get_search_params(search_api, search_api_config)
 
     query_list = [query.search_query for query in search_queries]
-    source_str = await select_and_execute_search(search_api, query_list, params_to_pass)
+    
+    # 🧠 智能搜索集成：检查是否启用智能研究模式
+    research_mode = get_config_value(configurable.research_mode, "simple")
+    
+    if research_mode and research_mode != "simple":
+        print(f"🧠 Workflow启用智能研究模式: {research_mode}")
+        source_str = await intelligent_search_web_unified(query_list, config, search_api, params_to_pass)
+    else:
+        # 使用传统搜索
+        source_str = await select_and_execute_search(search_api, query_list, params_to_pass)
 
     return {"source_str": source_str, "search_iterations": state["search_iterations"] + 1}
 

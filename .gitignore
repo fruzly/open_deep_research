@@ -70,3 +70,5 @@ temp/
 .langgraph_api
 
 docs/*
+
+tests/history/*

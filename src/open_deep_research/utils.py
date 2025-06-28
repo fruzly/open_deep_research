@@ -1029,7 +1029,7 @@ async def linkup_search(search_queries, depth: Optional[str] = "standard"):
     return search_results
 
 @traceable
-async def google_search_async(search_queries: Union[str, List[str]], max_results: int = 5, include_raw_content: bool = True):
+async def google_custom_search_async(search_queries: Union[str, List[str]], max_results: int = 5, include_raw_content: bool = True):
     """
     Performs concurrent web searches using Google.
     Uses Google Custom Search API if environment variables are set, otherwise falls back to web scraping.
@@ -1344,7 +1344,8 @@ async def gemini_google_search_async(search_queries: Union[str, List[str]], max_
         search_queries = [search_queries]
     
     # First use regular Google search to get results
-    search_results = await google_search_async(search_queries, max_results, include_raw_content)
+    search_results = await google_custom_search_async(search_queries, max_results, include_raw_content)
+    logger.info(f"Google search results: {search_results}")
     
     # Check if Gemini API Key is available for enhanced analysis
     if not os.environ.get("GEMINI_API_KEY"):
@@ -1387,6 +1388,8 @@ async def gemini_google_search_async(search_queries: Union[str, List[str]], max_
             try:
                 # Call Gemini for analysis
                 response = await gemini_model.ainvoke(analysis_prompt)
+                logger.info(f"Gemini analysis response: {response}")
+                # logger.info(f"Gemini analysis response (first 100 chars): {str(response)[:100]}")
                 ai_analysis = response.content if hasattr(response, 'content') else str(response)
                 
                 # Enhance original results
@@ -1934,7 +1937,7 @@ async def select_and_execute_search(search_api: str, query_list: list[str], para
             logger.info(f"Linkup search results: {search_results}")
         elif search_api == "googlesearch":
             logger.debug("Using Google search")
-            search_results = await google_search_async(query_list, **params_to_pass)
+            search_results = await google_custom_search_async(query_list, **params_to_pass)
             logger.info(f"Google search completed - result_length: {len(search_results)}")
             logger.info(f"Google search results: {search_results}")
         elif search_api == "azureaisearch":

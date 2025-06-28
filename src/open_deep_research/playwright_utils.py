@@ -499,7 +499,8 @@ async def smart_content_fetch(urls: List[str],
                     })
                 else:
                     processed_regular_results.append(result)
-            logger.info(f"Processed Regular Results Length: {len(processed_regular_results)} \n Processed Regular Results: {processed_regular_results}")
+            logger.info(f"Processed Regular Results Length: {len(processed_regular_results)}")
+            logger.debug(f"Processed Regular Results: {processed_regular_results}")
             results.extend(processed_regular_results)
             
         except Exception as e:
@@ -547,7 +548,8 @@ async def smart_content_fetch(urls: List[str],
                         "error": str(e),
                         "method": "failed"
                     })
-    logger.info(f"smart_content_fetch>> Results Length: {len(results)} \n Results: {results}")
+    logger.info(f"smart_content_fetch>> Results Length: {len(results)}")
+    logger.debug(f"smart_content_fetch>> Results: {results}")
     return results
 
 # Installation guidance function

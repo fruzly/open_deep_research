@@ -162,7 +162,9 @@ def get_search_tool(config: RunnableConfig):
         @tool
         async def gemini_google_search_tool(queries: List[str]) -> str:
             """Perform intelligent search using Gemini Google search engine"""
-            return await gemini_google_search(queries, config)
+            logger.info(f"🔍 [SearchTool] [geminigooglesearch] Performing Gemini Google search with queries: {queries}")
+            # return await gemini_google_search(queries, config) # search + analysis
+            return await intelligent_search_web_unified(queries, config, "geminigooglesearch")
         search_tool = gemini_google_search_tool
     elif search_api.lower() == "azureaisearch":
         @tool

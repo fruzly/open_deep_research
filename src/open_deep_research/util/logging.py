@@ -25,11 +25,12 @@ _logging_configured = False
 _file_logging_configured = False
 
 
-def configure_logging(force_file_logging: bool = False) -> None:
+def configure_logging(force_file_logging: bool = False, log_filename: Optional[str] = None) -> None:
     """Configure the structured logging system.
 
     Args:
         force_file_logging: Force file logging, ignoring debug mode.
+        log_filename: Specifies a custom log file name.
     """
     global _logging_configured
     
@@ -128,37 +129,42 @@ def configure_logging(force_file_logging: bool = False) -> None:
     
     # Configure file logging
     if not settings.debug or is_stdio_mode:
-        setup_file_logging()
+        setup_file_logging(log_filename=log_filename)
     
     # Mark as configured
     _logging_configured = True
 
 
-def setup_file_logging() -> None:
-    """Set up file logging."""
+def setup_file_logging(log_filename: Optional[str] = None) -> None:
+    """Set up file logging.
+
+    Args:
+        log_filename: Specifies a custom log file name.
+    """
     global _file_logging_configured
     
-    # Prevent duplicate file log configuration
-    if _file_logging_configured:
+    # If a specific filename is specified, bypass the global configuration check
+    # The global flag is only used to prevent repeated configuration of the default logger
+    if log_filename is None and _file_logging_configured:
         return
     
     # Ensure logs directory exists
     settings.logs_dir.mkdir(parents=True, exist_ok=True)
     
-    log_file = settings.logs_dir / "core.log"
+    log_file_name = log_filename or "core.log"
+    log_file = settings.logs_dir / log_file_name
     
     # Get the root logger
     root_logger = logging.getLogger()
     
     # Check if a file handler with the same name already exists
-    existing_file_handlers = [
-        h for h in root_logger.handlers 
-        if isinstance(h, logging.FileHandler) and h.baseFilename == str(log_file.absolute())
-    ]
-    
-    if existing_file_handlers:
-        # The same file handler already exists, no need to add it again
-        _file_logging_configured = True
+    if any(
+        isinstance(h, logging.FileHandler) and h.baseFilename == str(log_file.absolute())
+        for h in root_logger.handlers
+    ):
+        # If the handler already exists, no need to add it again
+        if log_filename is None:
+            _file_logging_configured = True
         return
     
     # Create file handler, ensuring UTF-8 encoding
@@ -235,7 +241,8 @@ def setup_file_logging() -> None:
     root_logger.addHandler(file_handler)
     
     # Mark file logging as configured
-    _file_logging_configured = True
+    if log_filename is None:
+        _file_logging_configured = True
 
 
 def get_logger(name: Optional[str] = None) -> structlog.stdlib.BoundLogger:

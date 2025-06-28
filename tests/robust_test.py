@@ -9,8 +9,15 @@ import asyncio
 import uuid
 import os
 from datetime import datetime
-from src.open_deep_research.multi_agent import supervisor_builder
+from open_deep_research.intelligent_research.core import ResearchMode
+from open_deep_research.multi_agent import supervisor_builder
 from langgraph.checkpoint.memory import MemorySaver
+
+from open_deep_research.util.logging import configure_logging, get_logger, reset_logging_config
+
+
+# 重置日志配置
+reset_logging_config()
 
 async def test_no_search_mode():
     """测试无搜索模式 - 最稳定的配置"""
@@ -31,6 +38,8 @@ async def test_no_search_mode():
             "number_of_queries": 1,
             "ask_for_clarification": False,
             "include_source_str": False,  # 无搜索时不需要源信息
+            "research_mode": ResearchMode.REFLECTIVE.value,
+            "max_research_iterations": 3
         }
         
         thread_config = {
@@ -40,9 +49,9 @@ async def test_no_search_mode():
         
         # 简化的测试查询
         query = """
-        Write a comprehensive report about Python programming language. 
+        Write a comprehensive report about Rust programming language. 
         Include the following sections:
-        1. Introduction - What is Python and why is it popular
+        1. Introduction - What is Rust and why is it popular
         2. Key Features and Advantages
         3. Main Applications and Use Cases
         4. Popular Libraries and Frameworks
@@ -154,12 +163,14 @@ async def test_conservative_search():
         # 🔧 保守搜索配置
         config = {
             "thread_id": str(uuid.uuid4()),
-            "search_api": "duckduckgo",
+            "search_api": "geminigooglesearch",
             "supervisor_model": "google_genai:gemini-2.5-flash-lite-preview-06-17",
             "researcher_model": "google_genai:gemini-2.5-flash-lite-preview-06-17",
             "number_of_queries": 1,  # 🔑 只做1次查询
-            "ask_for_clarification": False,
+            "ask_for_clarification": True,
             "include_source_str": True,
+            "research_mode": ResearchMode.REFLECTIVE.value,
+            "max_research_iterations": 3
         }
         
         thread_config = {
@@ -168,13 +179,13 @@ async def test_conservative_search():
         }
         
         # 更简单的查询
-        query = "Write a brief report about Python programming language, covering its main features and applications."
+        query = "Write a brief report about Rust programming language, covering its main features and applications."
         
         test_msg = [{"role": "user", "content": query}]
         
         print(f"📝 查询: {query}")
         print(f"⚙️ 配置: 保守搜索（1次查询），递归限制: 20")
-        print("⚠️ 注意: 可能遇到DuckDuckGo速率限制")
+        print("⚠️ 注意: 可能遇到 geminigooglesearch 速率限制")
         
         # 添加延迟避免速率限制
         print("🕐 等待3秒避免速率限制...")
@@ -224,6 +235,9 @@ async def test_conservative_search():
         return False
 
 async def main():
+    _success2 = await test_conservative_search()
+    
+async def main1():
     """主测试函数"""
     print("🛡️ 稳定版完整报告生成测试")
     print("="*60)
@@ -314,9 +328,19 @@ async def main():
     print(f"\n🏁 测试完成: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 if __name__ == "__main__":
-    print("""
+    # 配置日志到文件，完全避免污染stdio
+    # Create a unique log file name for this test run
+    log_filename = f"robust_test_no_search_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    configure_logging(force_file_logging=True, log_filename=log_filename)
+
+    logger = get_logger("robust_test")
+    logger.info(f"Robust test started, logging to {log_filename}")
+
+    print(f"""
 🛡️ 稳定版完整报告生成测试
 ============================
+
+(Logs are being saved to: {log_filename})
 
 本脚本专门解决以下问题：
 ✅ DuckDuckGo API 速率限制 (202 Ratelimit)
@@ -334,8 +358,10 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n\n⚠️ 用户中断测试")
+        logger.warning("Test run interrupted by user.")
+        print("\\n\\n⚠️ 用户中断测试")
     except Exception as e:
-        print(f"\n❌ 测试运行失败: {e}")
+        logger.error("An unhandled exception occurred during the test run.", exc_info=True)
+        print(f"\\n❌ 测试运行失败: {e}")
         import traceback
         traceback.print_exc() 

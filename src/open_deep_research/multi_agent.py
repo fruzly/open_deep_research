@@ -58,7 +58,7 @@ def _infer_message_role(msg) -> str:
     return "unknown"
 
 
-def fix_gemini_message_sequence(messages) -> list:
+def _fix_gemini_message_sequence(messages) -> list:
     """
     Fix message sequence to comply with Gemini API requirements
     
@@ -96,7 +96,7 @@ def fix_gemini_message_sequence(messages) -> list:
     return fixed_messages
 
 
-def ensure_user_message_ending(messages, default_content: str = "Please continue.") -> list:
+def _ensure_user_message_ending(messages, default_content: str = "Please continue.") -> list:
     """
     Ensure message sequence ends with user message (Gemini recommendation)
     
@@ -135,50 +135,31 @@ def get_search_tool(config: RunnableConfig):
         logger.info("🚫 [SearchTool] Search function disabled")
         return None
 
-    # TODO: Configure other search functions as tools
-    if search_api.lower() == "tavily":
-        # Create intelligent search wrapper
-        @tool
-        async def intelligent_tavily_search(queries: List[str]) -> str:
-            """Perform intelligent search using Tavily search engine"""
-            return await intelligent_search_web_unified(queries, config, "tavily")
-        search_tool = intelligent_tavily_search
-        
-    elif search_api.lower() == "duckduckgo":
-        # Create intelligent search wrapper
-        @tool
-        async def intelligent_duckduckgo_search(queries: List[str]) -> str:
-            """Perform intelligent search using DuckDuckGo search engine"""
-            return await intelligent_search_web_unified(queries, config, "duckduckgo")
-        search_tool = intelligent_duckduckgo_search
-    elif search_api.lower() == "googlesearch":
-        # Create intelligent Google search wrapper
-        @tool
-        async def intelligent_google_search_tool(queries: List[str]) -> str:
-            """Perform intelligent search using Google search engine"""
-            return await intelligent_search_web_unified(queries, config, "googlesearch")
-        search_tool = intelligent_google_search_tool
-    elif search_api.lower() == "geminigooglesearch":
-        @tool
-        async def gemini_google_search_tool(queries: List[str]) -> str:
-            """Perform intelligent search using Gemini Google search engine"""
-            logger.info(f"🔍 [SearchTool] [geminigooglesearch] Performing Gemini Google search with queries: {queries}")
-            # return await gemini_google_search(queries, config) # search + analysis
-            return await intelligent_search_web_unified(queries, config, "geminigooglesearch")
-        search_tool = gemini_google_search_tool
-    elif search_api.lower() == "azureaisearch":
-        @tool
-        async def azureaisearch_search_tool(queries: List[str]) -> str:
-            """Perform intelligent search using Azure AI search engine"""
-            return await azureaisearch_search(queries, config)
-        search_tool = azureaisearch_search_tool
-    else:
+    # A dictionary mapping search API names to their corresponding search functions
+    search_functions = {
+        "tavily": lambda queries, config: intelligent_search_web_unified(queries, config, "tavily"),
+        "duckduckgo": lambda queries, config: intelligent_search_web_unified(queries, config, "duckduckgo"),
+        "googlesearch": lambda queries, config: intelligent_search_web_unified(queries, config, "googlesearch"),
+        "geminigooglesearch": lambda queries, config: intelligent_search_web_unified(queries, config, "geminigooglesearch"),
+        "azureaisearch": azureaisearch_search,
+    }
+
+    # Get the search function from the dictionary
+    search_function = search_functions.get(search_api.lower())
+
+    if not search_function:
         logger.error(f"❌ [SearchTool] Unsupported search API: {search_api}")
         raise NotImplementedError(
             f"The search API '{search_api}' is not yet supported in the multi-agent implementation. "
             f"Currently, only Tavily/DuckDuckGo/GoogleSearch/GeminiGoogleSearch/AzureAISearch/None is supported. Please use the graph-based implementation in "
             f"src/open_deep_research/graph.py for other search APIs, or set search_api to one of the supported options."
         )
+
+    # Create a generic search tool
+    @tool
+    async def search_tool(queries: List[str]) -> str:
+        """Perform intelligent search using the configured search engine"""
+        return await search_function(queries, config)
 
     tool_metadata = {**(search_tool.metadata or {}), "type": "search"}
     search_tool.metadata = tool_metadata
@@ -236,32 +217,16 @@ class FinishReport(BaseModel):
     """Finish the report."""
 
 ## State
-class ReportStateOutput(MessagesState):
-    final_report: str # Final report
-    # for evaluation purposes only
-    # this is included only if configurable.include_source_str is True
-    source_str: str # String of formatted source content from web search
-
-class ReportState(MessagesState):
-    sections: list[str] # List of report sections 
-    completed_sections: Annotated[list[Section], operator.add] # Send() API key
-    final_report: str # Final report
-    # for evaluation purposes only
-    # this is included only if configurable.include_source_str is True
-    source_str: Annotated[str, operator.add] # String of formatted source content from web search
-
-class SectionState(MessagesState):
-    section: str # Report section  
-    completed_sections: list[Section] # Final key we duplicate in outer state for Send() API
-    # for evaluation purposes only
-    # this is included only if configurable.include_source_str is True
-    source_str: str # String of formatted source content from web search
-
-class SectionOutputState(TypedDict):
-    completed_sections: list[Section] # Final key we duplicate in outer state for Send() API
-    # for evaluation purposes only
-    # this is included only if configurable.include_source_str is True
-    source_str: str # String of formatted source content from web search
+class AppState(TypedDict):
+    messages: Annotated[list, operator.add]
+    sections: list[str]
+    completed_sections: Annotated[list[Section], operator.add]
+    final_report: str
+    source_str: Annotated[str, operator.add]
+    
+    # The initialized tools for each agent
+    supervisor_tools: list[BaseTool]
+    research_tools: list[BaseTool]
 
 
 async def _load_mcp_tools(
@@ -324,7 +289,7 @@ async def get_research_tools(config: RunnableConfig) -> list[BaseTool]:
     return tools
 
 
-async def supervisor(state: ReportState, config: RunnableConfig):
+async def supervisor(state: AppState, config: RunnableConfig):
     """LLM decides whether to call a tool or not"""
     
     logger.info("🎯 [Supervisor] Starting supervisor task execution")
@@ -389,10 +354,8 @@ async def supervisor(state: ReportState, config: RunnableConfig):
     ] + messages
 
     # Invoke
-    logger.info(f"🚀 [Supervisor] Invoking LLM with {len(llm_messages)} messages")
-    logger.info()
-    logger.info(llm_messages)
-    logger.info()
+    logger.info(f"🚀 [Supervisor] Invoking LLM with {len(llm_messages)} messages.")
+    logger.debug(f"📜 [Supervisor] LLM Messages: {llm_messages}")
     
     response = await llm_with_tools.ainvoke(llm_messages)
     logger.info(f"✅ [Supervisor] LLM response completed with {len(response.tool_calls) if hasattr(response, 'tool_calls') and response.tool_calls else 0} tool calls")
@@ -401,139 +364,109 @@ async def supervisor(state: ReportState, config: RunnableConfig):
         "messages": [response]
     }
 
-async def supervisor_tools(state: ReportState, config: RunnableConfig)  -> Command[Literal["supervisor", "research_team", "__end__"]]:
+async def _execute_tool(tool_call, tools_by_name, config):
+    """A helper function to execute a single tool call."""
+    tool_name = tool_call["name"]
+    args = tool_call.get('args', {})
+    logger.info(f"🛠️ [ToolExecutor] Executing tool: {tool_name} with args: {args}")
+    
+    tool = tools_by_name[tool_name]
+    try:
+        observation = await tool.ainvoke(args, config)
+        logger.info(f"✅ [ToolExecutor] Tool {tool_name} executed successfully")
+    except NotImplementedError:
+        observation = tool.invoke(args, config)
+        logger.info(f"✅ [ToolExecutor] Tool {tool_name} executed successfully (sync)")
+    except Exception as e:
+        logger.error(f"❌ [ToolExecutor] Tool {tool_name} with args {args} execution failed: {e}")
+        raise
+
+    return {"role": "tool", "content": observation, "name": tool_call["name"], "tool_call_id": tool_call["id"]}, observation
+
+
+async def supervisor_tools(state: AppState, config: RunnableConfig) -> Command[Literal["supervisor", "research_team", "__end__"]]:
     """Performs the tool call and sends to the research agent"""
     logger.info("🔧 [SupervisorTools] Starting tool execution")
-    
+
     configurable = MultiAgentConfiguration.from_runnable_config(config)
+    tool_calls = state["messages"][-1].tool_calls if state["messages"] and hasattr(state["messages"][-1], 'tool_calls') else []
+    logger.info(f"📋 [SupervisorTools] Need to execute {len(tool_calls)} tool calls: {[tc.get('name', 'unknown') for tc in tool_calls]}")
+
+    supervisor_tool_list = await get_supervisor_tools(config)
+    supervisor_tools_by_name = {tool.name: tool for tool in supervisor_tool_list}
+    search_tool_names = {tool.name for tool in supervisor_tool_list if tool.metadata and tool.metadata.get("type") == "search"}
 
     result = []
     sections_list = []
     intro_content = None
     conclusion_content = None
     source_str = ""
-    
-    # Count tool calls
-    tool_calls = state["messages"][-1].tool_calls if state["messages"] and hasattr(state["messages"][-1], 'tool_calls') else []
-    logger.info(f"📋 [SupervisorTools] Need to execute {len(tool_calls)} tool calls: {[tc.get('name', 'unknown') for tc in tool_calls]}")
 
-    # Get tools based on configuration
-    supervisor_tool_list = await get_supervisor_tools(config)
-    supervisor_tools_by_name = {tool.name: tool for tool in supervisor_tool_list}
-    search_tool_names = {
-        tool.name
-        for tool in supervisor_tool_list
-        if tool.metadata is not None and tool.metadata.get("type") == "search"
-    }
-
-    # First process all tool calls to ensure we respond to each one (required for OpenAI)
-    for tool_call in state["messages"][-1].tool_calls:
+    for tool_call in tool_calls:
         tool_name = tool_call["name"]
-        logger.info(f"🛠️ [SupervisorTools] Executing tool: {tool_name}, args: {tool_call.get('args', {})}")
-        
-        # Get the tool
-        tool = supervisor_tools_by_name[tool_name]
-        # Perform the tool call - use ainvoke for async tools
-        try:
-            observation = await tool.ainvoke(tool_call["args"], config)
-            logger.info(f"✅ [SupervisorTools] Tool {tool_name} executed successfully")
-        except NotImplementedError:
-            observation = tool.invoke(tool_call["args"], config)
-            logger.info(f"✅ [SupervisorTools] Tool {tool_name} executed successfully (sync)")
-        except Exception as e:
-            logger.error(f"❌ [SupervisorTools] Tool {tool_name} execution failed: {e}")
-            raise
+        # args = tool_call.get('args', {})
+        # logger.info(f"🛠️ [SupervisorTools] Executing tool: {tool_name} with args: {args}")
+        # tool = supervisor_tools_by_name[tool_name]
 
-        # Append to messages 
-        result.append({"role": "tool", 
-                       "content": observation, 
-                       "name": tool_call["name"], 
-                       "tool_call_id": tool_call["id"]})
-        
-        # Store special tool results for processing after all tools have been called
-        if tool_call["name"] == "Question":
-            # Question tool was called - return to supervisor to ask the question
+        # try:
+        #     observation = await tool.ainvoke(args, config)
+        #     logger.info(f"✅ [SupervisorTools] Tool {tool_name} executed successfully with observation: {observation}")
+        # except NotImplementedError:
+        #     observation = tool.invoke(args, config)
+        #     logger.info(f"✅ [SupervisorTools] Tool {tool_name} executed successfully (sync) with observation: {observation}")
+        # except Exception as e:
+        #     logger.error(f"❌ [SupervisorTools] Tool {tool_name} with args {args} execution failed: {e}")
+        #     raise
+
+        # result.append({"role": "tool", "content": observation, "name": tool_call["name"], "tool_call_id": tool_call["id"]})
+
+        tool_prompt_result, observation = await _execute_tool(tool_call, supervisor_tools_by_name, config)
+        result.append(tool_prompt_result)
+
+        if tool_name == "Question":
             question_obj = cast(Question, observation)
             logger.info(f"❓ [SupervisorTools] Generated question: {question_obj.question}")
             result.append({"role": "assistant", "content": question_obj.question})
             return Command(goto=END, update={"messages": result})
-        elif tool_call["name"] == "Sections":
+        elif tool_name == "Sections":
             sections_list = cast(Sections, observation).sections
             logger.info(f"📋 [SupervisorTools] Generated {len(sections_list)} sections: {sections_list}")
-        elif tool_call["name"] == "Introduction":
-            # Format introduction with proper H1 heading if not already formatted
+        elif tool_name == "Introduction":
             observation = cast(Introduction, observation)
-            if not observation.content.startswith("# "):
-                intro_content = f"# {observation.name}\n\n{observation.content}"
-            else:
-                intro_content = observation.content
+            intro_content = f"# {observation.name}\n\n{observation.content}" if not observation.content.startswith("# ") else observation.content
             logger.info(f"📝 [SupervisorTools] Generated introduction: {observation.name}")
-        elif tool_call["name"] == "Conclusion":
-            # Format conclusion with proper H2 heading if not already formatted
+        elif tool_name == "Conclusion":
             observation = cast(Conclusion, observation)
-            if not observation.content.startswith("## "):
-                conclusion_content = f"## {observation.name}\n\n{observation.content}"
-            else:
-                conclusion_content = observation.content
+            conclusion_content = f"## {observation.name}\n\n{observation.content}" if not observation.content.startswith("## ") else observation.content
             logger.info(f"🏁 [SupervisorTools] Generated conclusion: {observation.name}")
-        elif tool_call["name"] in search_tool_names:
-            # 🧠 Intelligent search integration: Check if intelligent research mode is enabled
-            research_mode = get_config_value(configurable.research_mode, "simple")
-            
-            if research_mode and research_mode != "simple":
-                # Use intelligent search interface
-                try:
-                    logger.info(f"🧠 Supervisor enabled intelligent research mode: {research_mode}")
-                    # observation should already be the result of intelligent search
-                    pass
-                except Exception as e:
-                    logger.error(f"⚠️ Supervisor intelligent search failed: {e}")
-            
+        elif tool_name in search_tool_names:
             if configurable.include_source_str:
                 source_str += cast(str, observation)
 
-    # After processing all tool calls, decide what to do next
     if sections_list:
-        # Send the sections to the research agents
         logger.info(f"🎯 [SupervisorTools] Assigning {len(sections_list)} sections to research team")
         return Command(goto=[Send("research_team", {"section": s}) for s in sections_list], update={"messages": result})
-    elif intro_content:
-        # Store introduction while waiting for conclusion
-        # Append to messages to guide the LLM to write conclusion next
+
+    state_update = {"messages": result}
+    if intro_content:
         logger.info("📝 [SupervisorTools] Introduction completed, waiting for conclusion")
         result.append({"role": "user", "content": "Introduction written. Now write a conclusion section."})
-        state_update = {
-            "final_report": intro_content,
-            "messages": result,
-        }
+        state_update["final_report"] = intro_content
     elif conclusion_content:
-        # Get all sections and combine in proper order: Introduction, Body Sections, Conclusion
         intro = state.get("final_report", "")
         body_sections = "\n\n".join([s.content for s in state["completed_sections"]])
-        
-        # Assemble final report in correct order
         complete_report = f"{intro}\n\n{body_sections}\n\n{conclusion_content}"
-        
         logger.info(f"🎉 [SupervisorTools] Report completed! Total length: {len(complete_report)} characters")
-        
-        # Append to messages to indicate completion
         result.append({"role": "user", "content": "Report is now complete with introduction, body sections, and conclusion."})
+        state_update["final_report"] = complete_report
 
-        state_update = {
-            "final_report": complete_report,
-            "messages": result,
-        }
-    else:
-        # Default case (for search tools, etc.)
-        state_update = {"messages": result}
-
-    # Include source string for evaluation
     if configurable.include_source_str and source_str:
         state_update["source_str"] = source_str
 
+    logger.info(f"📤 [SupervisorTools] Returning state update with keys: {state_update.keys()}")
     return Command(goto="supervisor", update=state_update)
 
-async def supervisor_should_continue(state: ReportState) -> str:
+async def supervisor_should_continue(state: AppState) -> str:
     """Decide if we should continue the loop or stop based upon whether the LLM made a tool call"""
 
     messages = state["messages"]
@@ -550,7 +483,7 @@ async def supervisor_should_continue(state: ReportState) -> str:
     logger.info(f"➡️ [SupervisorControl] Supervisor continuing with tools: {tool_names}")
     return "supervisor_tools"
 
-async def research_agent(state: SectionState, config: RunnableConfig):
+async def research_agent(state: AppState, config: RunnableConfig):
     """LLM decides whether to call a tool or not"""
     
     section_name = state.get("section", "Unknown section")
@@ -604,7 +537,8 @@ async def research_agent(state: SectionState, config: RunnableConfig):
         }
     ] + messages
 
-    logger.info(f"🚀 [Researcher] Invoking LLM with {len(llm_messages)} messages")
+    logger.info(f"🚀 [Researcher] Invoking LLM with {len(llm_messages)} messages.")
+    logger.debug(f"📜 [Researcher] LLM Messages: {llm_messages}")
     
     response = await llm.bind_tools(research_tool_list,             
                           #  parallel_tool_calls=False,
@@ -622,7 +556,7 @@ async def research_agent(state: SectionState, config: RunnableConfig):
     
     return result
 
-async def research_agent_tools(state: SectionState, config: RunnableConfig):
+async def research_agent_tools(state: AppState, config: RunnableConfig):
     """Performs the tool call and route to supervisor or continue the research loop"""
     logger.info("🔧 [ResearcherTools] Starting research tool execution")
     
@@ -648,36 +582,37 @@ async def research_agent_tools(state: SectionState, config: RunnableConfig):
     logger.info(f"🔧 [ResearcherTools] Search tools: {search_tool_names}")
     
     # Process all tool calls first (required for OpenAI)
-    for tool_call in state["messages"][-1].tool_calls:
+    for tool_call in tool_calls:
         tool_name = tool_call["name"]
-        logger.info(f"🛠️ [ResearcherTools] Executing tool: {tool_name}, args: {tool_call.get('args', {})}")
+        # args = tool_call.get('args', {})
+        # logger.info(f"🛠️ [ResearcherTools] Executing tool: {tool_name} with args: {args}")
         
         # Get the tool
-        tool = research_tools_by_name[tool_name]
+        # tool = research_tools_by_name[tool_name]
         # Perform the tool call - use ainvoke for async tools
-        try:
-            observation = await tool.ainvoke(tool_call["args"], config)
-            logger.info(f"✅ [ResearcherTools] Tool {tool_name} executed successfully")
-        except NotImplementedError:
-            observation = tool.invoke(tool_call["args"], config)
-            logger.info(f"✅ [ResearcherTools] Tool {tool_name} executed successfully (sync)")
-        except Exception as e:
-            logger.error(f"❌ [ResearcherTools] Tool {tool_name} execution failed: {e}")
-            raise
+        # try:
+        #     observation = await tool.ainvoke(args, config)
+        #     logger.info(f"✅ [ResearcherTools] Tool {tool_name} executed successfully with observation: {observation}")
+        # except NotImplementedError:
+        #     observation = tool.invoke(args, config)
+        #     logger.info(f"✅ [ResearcherTools] Tool {tool_name} executed successfully (sync) with observation: {observation}")
+        # except Exception as e:
+        #     logger.error(f"❌ [ResearcherTools] Tool {tool_name} with args {args} execution failed: {e}")
+        #     raise
 
         # Append to messages 
-        result.append({"role": "tool", 
-                       "content": observation, 
-                       "name": tool_call["name"], 
-                       "tool_call_id": tool_call["id"]})
+        # result.append({"role": "tool", "content": observation, "name": tool_call["name"], "tool_call_id": tool_call["id"]})
+        
+        tool_prompt_result, observation = await _execute_tool(tool_call, research_tools_by_name, config)
+        result.append(tool_prompt_result)
         
         # Store the section observation if a Section tool was called
-        if tool_call["name"] == "Section":
+        if tool_name == "Section":
             completed_section = cast(Section, observation)
             logger.info(f"📝 [ResearcherTools] Completed section: {completed_section.name}, content length: {len(completed_section.content)} characters")
 
         # 🧠 Intelligent search integration: Check if intelligent research mode is enabled
-        if tool_call["name"] in search_tool_names:
+        if tool_name in search_tool_names:
             research_mode = get_config_value(configurable.research_mode, "simple")
             logger.info(f"research_mode: {research_mode}")
             if research_mode and research_mode != "simple":
@@ -702,10 +637,10 @@ async def research_agent_tools(state: SectionState, config: RunnableConfig):
         state_update["source_str"] = source_str
         logger.debug(f"📊 [ResearcherTools] Including source string, length: {len(source_str)} characters")
 
-    logger.info(f"📤 [ResearcherTools] Returning state update with {len(state_update)} fields")
+    logger.info(f"📤 [ResearcherTools] Returning state update with keys: {state_update.keys()}")
     return state_update
 
-async def research_agent_should_continue(state: SectionState) -> str:
+async def research_agent_should_continue(state: AppState) -> str:
     """Decide if we should continue the loop or stop based upon whether the LLM made a tool call"""
 
     messages = state["messages"]
@@ -728,7 +663,7 @@ logger.info("🔧 [ResearchBuilder] Starting to build multi-agent workflow")
 
 # Research agent workflow
 logger.info("📊 [ResearchBuilder] Building research agent workflow # Start")
-research_builder = StateGraph(SectionState, output=SectionOutputState, config_schema=MultiAgentConfiguration)
+research_builder = StateGraph(AppState, output=AppState, config_schema=MultiAgentConfiguration)
 research_builder.add_node("research_agent", research_agent)
 research_builder.add_node("research_agent_tools", research_agent_tools)
 research_builder.add_edge(START, "research_agent") 
@@ -741,7 +676,7 @@ research_builder.add_edge("research_agent_tools", "research_agent")
 logger.info("📊 [ResearchBuilder] Building research agent workflow # Completed")
 # Supervisor workflow
 logger.info("👑 [SupervisorBuilder] Building supervisor workflow # Start")
-supervisor_builder = StateGraph(ReportState, input=MessagesState, output=ReportStateOutput, config_schema=MultiAgentConfiguration)
+supervisor_builder = StateGraph(AppState, input=AppState, output=AppState, config_schema=MultiAgentConfiguration)
 supervisor_builder.add_node("supervisor", supervisor)
 supervisor_builder.add_node("supervisor_tools", supervisor_tools)
 supervisor_builder.add_node("research_team", research_builder.compile())

@@ -41,6 +41,7 @@ dependencies = [
     "langsmith>=0.3.37",
     "playwright>=1.42.0",
     "aiohttp>=3.9.0",
+    "Brotli>=1.1.0",
 ]
 
 [project.optional-dependencies]

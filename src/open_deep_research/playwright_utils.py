@@ -321,12 +321,12 @@ async def smart_content_fetch(urls: List[str],
         try:
             playwright_results = await fetch_with_playwright(playwright_urls)
             results.extend(playwright_results)
-        except NotImplementedError as e:
+        except (NotImplementedError, Exception) as e:
             logger.error(f"Playwright subprocess not supported on this platform: {e}")
             # Downgrade Playwright URLs to regular method
             logger.warning(f"Falling back to regular HTTP for {len(playwright_urls)} URLs")
             regular_urls.extend(playwright_urls)
-        except Exception as e:
+        except (NotImplementedError, Exception) as e:
             logger.error(f"Playwright failed unexpectedly: {e}")
             # Create error results for failed URLs
             for url in playwright_urls:

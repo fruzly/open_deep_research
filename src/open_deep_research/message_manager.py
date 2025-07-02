@@ -433,30 +433,51 @@ class UniversalMessageManager:
             
             # Check content and tool calls
             content = msg.get('content', '')
-            if content is None:
-                content = ''
+            # Ensure content is never None or truly empty before stripping
+            if content is None or (isinstance(content, str) and not content.strip()):
+                # Provide a minimal non-empty string for Gemini compatibility
+                content = " "
+                fixes.append(f"Message {i} had empty/None content, set to minimal placeholder.")
+                logger.debug(f"Message {i} had empty/None content, set to minimal placeholder.")
             else:
-                content = str(content).strip()
+                content = str(content)
             
             has_tool_calls = 'tool_calls' in msg and msg['tool_calls']
             is_tool_message = role == 'tool'
             
-            # For messages with empty content, perform stricter checks
-            if not content:
-                if has_tool_calls:
-                    # Assistant message with tool calls but no content is normal
-                    logger.debug(f"Message {i} is an assistant message with tool calls but no content")
-                    pass
+            has_tool_calls = 'tool_calls' in msg and msg['tool_calls']
+            is_tool_message = role == 'tool'
+
+            # Now, strip and check if it's empty. If so, provide more descriptive content.
+            stripped_content = content.strip()
+            if not stripped_content:
+                if has_tool_calls and role == 'assistant':
+                    if self.provider in (LLMProvider.GOOGLE_GENAI, LLMProvider.GOOGLE_VERTEXAI):
+                        content = "Calling tools."
+                        fixes.append(f"Message {i} is an assistant message with tool calls but empty content, provided default content for Gemini")
+                        logger.debug(f"Message {i} is an assistant message with tool calls but empty content, provided default content for Gemini")
+                    else:
+                        logger.debug(f"Message {i} is an assistant message with tool calls but no content (normal for this provider)")
+                        pass
                 elif is_tool_message:
-                    # Tool message must have content
-                    fixes.append(f"Message {i} is a tool message but content is empty, skipping")
-                    logger.warning(f"Message {i} is a tool message but content is empty")
-                    continue
+                    content = "Tool execution completed."
+                    fixes.append(f"Message {i} is a tool message but content is empty, provided default content")
+                    logger.warning(f"Message {i} is a tool message but content is empty, provided default content")
                 else:
-                    # Skip other empty messages
-                    fixes.append(f"Message {i} has empty content and no tool calls, skipping")
-                    logger.debug(f"Message {i} has empty content and no tool calls")
-                    continue
+                    if role == 'user':
+                        content = "Please continue."
+                    elif role == 'assistant':
+                        content = "Continue."
+                    elif role == 'system':
+                        content = "System prompt."
+                    elif role == 'tool':
+                        content = "Tool execution completed."
+                    else:
+                        content = "Continue."
+                    fixes.append(f"Message {i} has empty content and no tool calls, provided default content")
+                    logger.debug(f"Message {i} has empty content and no tool calls, provided default content")
+            else:
+                content = stripped_content # Use the stripped content if it's not empty
             
             cleaned_msg = {
                 'role': role,
@@ -762,6 +783,19 @@ class UniversalMessageManager:
                             msg_copy['content'] = 'Continue.'
                         fixes.append(f"Added default content to message {i} ({role}) to avoid empty message")
                         logger.debug(f"Added default content to message {i} ({role})")
+                
+                # Final safety check: ensure content is never empty for Gemini
+                if not msg_copy['content'].strip():
+                    if role == 'assistant' and has_tool_calls:
+                        msg_copy['content'] = 'Calling tools.'
+                    elif role == 'user':
+                        msg_copy['content'] = 'Please continue.'
+                    elif role == 'tool':
+                        msg_copy['content'] = 'Tool execution completed.'
+                    else:
+                        msg_copy['content'] = 'Continue.'
+                    fixes.append(f"Final safety check: ensured non-empty content for message {i} ({role})")
+                    logger.debug(f"Final safety check: ensured non-empty content for message {i} ({role})")
             
             fixed_messages.append(msg_copy)
         
@@ -774,15 +808,42 @@ class UniversalMessageManager:
         
         fixes = []
         for i, msg in enumerate(messages):
-            if 'content' not in msg or not str(msg.get('content', '')).strip():
-                default = 'Continue.' if msg['role'] == 'assistant' else 'Please continue.'
-                if msg['role'] == 'system':
+            # Ensure content field exists and is not None
+            if 'content' not in msg:
+                msg['content'] = ''
+            elif msg['content'] is None:
+                msg['content'] = ''
+            else:
+                msg['content'] = str(msg['content'])
+            
+            # Check if content is empty or just whitespace
+            if not msg['content'].strip():
+                has_tool_calls = bool(msg.get('tool_calls'))
+                role = msg['role']
+                
+                # Provide appropriate default content
+                if role == 'assistant' and has_tool_calls:
+                    default = 'Calling tools.'
+                elif role == 'assistant':
+                    default = 'Continue.'
+                elif role == 'user':
+                    default = 'Please continue.'
+                elif role == 'system':
                     default = 'System prompt.'
-                elif msg['role'] == 'tool':
+                elif role == 'tool':
                     default = 'Tool execution completed.'
+                else:
+                    default = 'Continue.'
+                
                 msg['content'] = default
-                fixes.append(f"Final fallback: Filled in default content for message {i} ({msg['role']})")
-                logger.debug(f"Final fallback: Filled in default content for message {i} ({msg['role']})")
+                fixes.append(f"Final fallback: Filled in default content for message {i} ({role})")
+                logger.warning(f"Final fallback: Filled in default content for message {i} ({role}) - Original content was empty")
+            
+            # Final validation: ensure content is still not empty after assignment
+            if not msg['content'].strip():
+                msg['content'] = 'Continue.'
+                fixes.append(f"Emergency fallback: Set emergency content for message {i} ({msg.get('role', 'unknown')})")
+                logger.error(f"Emergency fallback: Had to set emergency content for message {i}")
         
         logger.debug(f"Empty content check complete - Fix count: {len(fixes)}")
         return messages, fixes

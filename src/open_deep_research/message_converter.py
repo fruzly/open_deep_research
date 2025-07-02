@@ -31,7 +31,27 @@ def convert_langchain_messages_to_dict(messages: List[Union[BaseMessage, Dict[st
                 logger.debug(f"Processing LangChain message object - index: {i}, type: {msg.type}")
                 
                 content = msg.content if msg.content is not None else ''
-                content = str(content).strip() if content else ''
+                # Ensure content is never empty or just whitespace for Gemini API compatibility
+                if not content or (isinstance(content, str) and not content.strip()):
+                    content = " " # Provide a single space to ensure it's not empty
+                    logger.debug(f"Provided single space for empty content - index: {i}, type: {msg.type}")
+
+                content = str(content)
+                
+                # Original logic for providing more descriptive default content if still too short
+                if len(content.strip()) < 2: # Check stripped length to avoid issues with just a space
+                    has_tool_calls = hasattr(msg, 'tool_calls') and msg.tool_calls
+                    if msg.type == 'ai' and has_tool_calls:
+                        content = "Calling tools."
+                    elif msg.type == 'human':
+                        content = "Please continue."
+                    elif msg.type == 'system':
+                        content = "System prompt."
+                    elif msg.type == 'tool':
+                        content = "Tool execution completed."
+                    else:
+                        content = "Continue."
+                    logger.debug(f"Provided more descriptive default content for short message - index: {i}, type: {msg.type}")
                 
                 if msg.type == 'human':
                     msg_dict = {"role": "user", "content": content}
@@ -61,18 +81,37 @@ def convert_langchain_messages_to_dict(messages: List[Union[BaseMessage, Dict[st
                     logger.debug(f"Converted tool message - index: {i}, content length: {len(content)}")
                 else:
                     # Fallback to user role
-                    msg_dict = {"role": "user", "content": content if content else "Please continue."}
+                    msg_dict = {"role": "user", "content": content}
                     dict_messages.append(msg_dict)
                     logger.warning(f"Unknown LangChain message type - index: {i}, type: {msg.type}, falling back to user role")
             elif isinstance(msg, dict):
-                # Already in dict format, but ensure content is not None
+                # Already in dict format, but ensure content is not None or empty
                 logger.debug(f"Processing dictionary format message - index: {i}")
                 msg_copy = msg.copy()
+                
+                # Ensure content field exists and is valid
                 if 'content' not in msg_copy or msg_copy['content'] is None:
                     msg_copy['content'] = ''
-                    logger.debug(f"Added empty content to dictionary message - index: {i}")
                 else:
                     msg_copy['content'] = str(msg_copy['content']).strip()
+                
+                # Ensure content is never empty for Gemini API compatibility
+                if not msg_copy['content']:
+                    role = msg_copy.get('role', 'user')
+                    has_tool_calls = bool(msg_copy.get('tool_calls'))
+                    
+                    if role == 'assistant' and has_tool_calls:
+                        msg_copy['content'] = "Calling tools."
+                    elif role == 'user':
+                        msg_copy['content'] = "Please continue."
+                    elif role == 'system':
+                        msg_copy['content'] = "System prompt."
+                    elif role == 'tool':
+                        msg_copy['content'] = "Tool execution completed."
+                    else:
+                        msg_copy['content'] = "Continue."
+                    logger.debug(f"Provided default content for empty dictionary message - index: {i}, role: {role}")
+                
                 dict_messages.append(msg_copy)
             else:
                 # Unknown format, convert to user message

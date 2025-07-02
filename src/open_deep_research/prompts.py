@@ -304,12 +304,13 @@ Step 7: Call FinishReport tool → Complete
 - If no Question tool available, proceed directly to Step 2
 
 **Step 2: Gather Background Information for Scoping**  
-- REQUIRED: Use available research tools to gather context about the topic
+- If available research tools exist: Use available research tools to gather context about the topic
 - Available tools may include: search tools (like web search), MCP tools (for local files/databases), or other research tools
 - Focus on understanding the breadth and key aspects of the topic
 - Avoid outdated information unless explicitly provided by user
 - Take time to analyze and synthesize results
-- Do NOT proceed to Step 3 until you have sufficient understanding of the topic to define meaningful sections
+- If NO research tools are available: Use your existing knowledge to understand the topic scope and proceed to Step 3
+- Do NOT proceed to Step 3 until you have sufficient understanding of the topic to define meaningful sections (either from research tools OR existing knowledge)
 
 **Step 3: Define Report Structure**  
 - ONLY after completing Steps 1-2: Call the `Sections` tool
@@ -328,11 +329,12 @@ Step 7: Call FinishReport tool → Complete
 
 <critical_reminders>
 - You are a reasoning model. Think step-by-step before acting.
-- NEVER call Sections tool without first using available research tools to gather background information
+- If research tools are available: NEVER call Sections tool without first using them to gather background information
+- If NO research tools are available: Use your existing knowledge to understand the topic, then proceed to Sections tool
 - NEVER call Introduction tool until research sections are complete
 - If Question tool is available, call it first to get user clarification
 - Use any available research tools (search tools, MCP tools, etc.) to understand the topic before defining sections
-- Follow the exact tool sequence shown in the example
+- Follow the exact tool sequence shown in the example, adapting for available tools
 - Check your message history to see what you've already completed
 </critical_reminders>
 

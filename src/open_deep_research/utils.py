@@ -170,7 +170,7 @@ def deduplicate_and_format_sources(
      # Collect all results
     sources_list = []
     for response in search_response:
-        sources_list.extend(response['content'])
+        sources_list.extend(response['results'])
 
     # Deduplicate by URL
     if deduplication_strategy == "keep_first":
@@ -1053,23 +1053,29 @@ async def google_custom_search_async(search_queries: Union[str, List[str]], max_
     api_key = os.environ.get("GOOGLE_API_KEY")
     cx = os.environ.get("GOOGLE_CX")
     use_api = bool(api_key and cx)
+    # use_api = False
     
     logger.info(f"Google search mode determined - use_api: {use_api}, has_api_key: {bool(api_key)}, has_cx: {bool(cx)}")
     
     # Define user agent generator
     def get_useragent():
         """Generates a random user agent string."""
-        lynx_version = f"Lynx/{random.randint(2, 3)}.{random.randint(8, 9)}.{random.randint(0, 2)}"
-        libwww_version = f"libwww-FM/{random.randint(2, 3)}.{random.randint(13, 15)}"
-        ssl_mm_version = f"SSL-MM/{random.randint(1, 2)}.{random.randint(3, 5)}"
-        openssl_version = f"OpenSSL/{random.randint(1, 3)}.{random.randint(0, 4)}.{random.randint(0, 9)}"
-        return f"{lynx_version} {libwww_version} {ssl_mm_version} {openssl_version}"
+        # 使用更真实的 User-Agent，模拟常见浏览器
+        user_agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
+        ]
+        return random.choice(user_agents)
     
     # Create executor for running synchronous operations
     executor = None if use_api else concurrent.futures.ThreadPoolExecutor(max_workers=5)
     
-    # Use a semaphore to limit concurrent requests
-    semaphore = asyncio.Semaphore(5 if use_api else 2)
+    # Use a semaphore to limit concurrent requests - 降低并发数
+    semaphore = asyncio.Semaphore(5 if use_api else 1)
     
     async def search_single_query(query):
         async with semaphore:
@@ -1093,8 +1099,14 @@ async def google_custom_search_async(search_queries: Union[str, List[str]], max_
                         }
                         logger.debug(f"Requesting Google API - query: {query}, num_results: {num}, start_index: {start_index}")
 
-                        async with aiohttp.ClientSession() as session:
-                            async with session.get('https://www.googleapis.com/customsearch/v1', params=params) as response:
+                        connector = aiohttp.TCPConnector(ssl=False)
+                        timeout = aiohttp.ClientTimeout(total=300)
+                        headers = {
+                            "User-Agent": get_useragent(),
+                            "Accept": "*/*"
+                        }
+                        async with aiohttp.ClientSession(connector=connector, timeout=timeout, headers=headers) as session:
+                            async with session.get(url='https://www.googleapis.com/customsearch/v1', params=params) as response:
                                 if response.status != 200:
                                     error_text = await response.text()
                                     logger.error(f"Google API request failed - status_code: {response.status}, error_text: {error_text[:500]}")  # Limit error text length
@@ -1122,8 +1134,8 @@ async def google_custom_search_async(search_queries: Union[str, List[str]], max_
                 
                 # Web scraping based search
                 else:
-                    # Add delay between requests
-                    await asyncio.sleep(0.5 + random.random() * 1.5)
+                    # Add delay between requests - 增加延迟时间
+                    await asyncio.sleep(2.0 + random.random() * 3.0)  # 2-5秒随机延迟
                     logger.debug(f"Starting Google web scraping - query: {query}")
 
                     # Define scraping function
@@ -1136,68 +1148,230 @@ async def google_custom_search_async(search_queries: Union[str, List[str]], max_
                             fetched_links = set()
                             search_results = []
                             
-                            while fetched_results < max_results:
-                                # Send request to Google
-                                resp = requests.get(
-                                    url="https://www.google.com/search",
-                                    headers={
-                                        "User-Agent": get_useragent(),
-                                        "Accept": "*/*"
-                                    },
-                                    params={
-                                        "q": query,
-                                        "num": max_results + 2,
-                                        "hl": lang,
-                                        "start": start,
-                                        "safe": safe,
-                                    },
-                                    cookies = {
-                                        'CONSENT': 'PENDING+987',  # Bypasses the consent page
-                                        'SOCS': 'CAESHAgBEhIaAB',
-                                    }
-                                )
-                                resp.raise_for_status()
-                                
-                                # Parse results
-                                soup = BeautifulSoup(resp.text, "html.parser")
-                                result_block = soup.find_all("div", class_="ezO2md")
-                                new_results = 0
-                                
-                                for result in result_block:
-                                    link_tag = result.find("a", href=True)
-                                    title_tag = link_tag.find("span", class_="CVA68e") if link_tag else None
-                                    description_tag = result.find("span", class_="FrIlee")
+                            # 添加重试机制
+                            max_retries = 3
+                            retry_count = 0
+                            
+                            while fetched_results < max_results and retry_count < max_retries:
+                                try:
+                                    # 创建 session 来保持 cookies
+                                    session = requests.Session()
                                     
-                                    if link_tag and title_tag and description_tag:
-                                        link = unquote(link_tag["href"].split("&")[0].replace("/url?q=", ""))
+                                    # 设置更真实的请求头
+                                    session.headers.update({
+                                        "User-Agent": get_useragent(),
+                                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+                                        "Accept-Language": "en-US,en;q=0.9",
+                                        "Accept-Encoding": "gzip, deflate, br",
+                                        "DNT": "1",
+                                        "Connection": "keep-alive",
+                                        "Upgrade-Insecure-Requests": "1",
+                                        "Sec-Fetch-Dest": "document",
+                                        "Sec-Fetch-Mode": "navigate",
+                                        "Sec-Fetch-Site": "none",
+                                        "Sec-Fetch-User": "?1",
+                                        "Cache-Control": "max-age=0",
+                                        "sec-ch-ua": '"Chromium";v="131", "Not A(Brand";v="99", "Google Chrome";v="131"',
+                                        "sec-ch-ua-mobile": "?0",
+                                        "sec-ch-ua-platform": '"Windows"'
+                                    })
+                                    
+                                    # 设置 cookies
+                                    session.cookies.update({
+                                        'CONSENT': 'YES+cb',
+                                        'SOCS': 'CAISHAgBEhJnd3NfMjAyMzA4MTAtMF9SQzIaAmVuIAEaBgiAyqymBg',
+                                    })
+                                    
+                                    # 首先访问 Google 主页来获取 cookies
+                                    try:
+                                        homepage_resp = session.get(
+                                            "https://www.google.com",
+                                            timeout=10,
+                                            proxies={
+                                                'http': os.environ.get('HTTP_PROXY'),
+                                                'https': os.environ.get('HTTPS_PROXY')
+                                            } if os.environ.get('HTTP_PROXY') or os.environ.get('HTTPS_PROXY') else None
+                                        )
+                                        time.sleep(0.5)  # 短暂延迟
+                                    except:
+                                        pass  # 忽略主页访问错误
+                                    
+                                    # Send request to Google
+                                    resp = session.get(
+                                        url="https://www.google.com/search",
+                                        params={
+                                            "q": query,
+                                            "num": max_results + 2,
+                                            "hl": lang,
+                                            "start": start,
+                                            "safe": safe,
+                                            "lr": lang,  # 添加语言限制
+                                            "gl": "us",  # 添加地理位置
+                                        },
+                                        timeout=30,
+                                        # 添加代理支持（如果配置了）
+                                        proxies={
+                                            'http': os.environ.get('HTTP_PROXY'),
+                                            'https': os.environ.get('HTTPS_PROXY')
+                                        } if os.environ.get('HTTP_PROXY') or os.environ.get('HTTPS_PROXY') else None,
+                                        allow_redirects=True
+                                    )
+                                    
+                                    # 检查是否被重定向到验证页面
+                                    if resp.status_code == 429 or "sorry/index" in resp.url:
+                                        logger.warning(f"Google rate limit detected, retry {retry_count + 1}/{max_retries}")
+                                        retry_count += 1
+                                        # 指数退避策略
+                                        time.sleep(5 * (2 ** retry_count) + random.random() * 5)
+                                        continue
                                         
-                                        if link in fetched_links:
+                                    resp.raise_for_status()
+                                    
+                                    # Parse results
+                                    soup = BeautifulSoup(resp.text, "html.parser")
+                                    
+                                    # 更全面的选择器列表
+                                    result_selectors = [
+                                        "div.g",  # 经典选择器
+                                        "div.Gx5Zad",  # 移动版
+                                        "div.MjjYud",  # 新版桌面
+                                        "div.kvH3mc",  # 另一种格式
+                                        "div.ezO2md",  # 旧选择器
+                                        "div[data-hveid]",  # 基于属性
+                                        "div.jfp3ef",  # 其他可能
+                                        "div.N54PNb",  # 其他可能
+                                        "div.hlcw0c",  # 其他可能
+                                        "div.kCrYT",  # 移动版结果
+                                        "div.BNeawe",  # 简化版结果
+                                    ]
+                                    
+                                    result_block = []
+                                    for selector in result_selectors:
+                                        result_block = soup.select(selector)
+                                        if result_block:
+                                            logger.debug(f"Found results using selector: {selector}, count: {len(result_block)}")
+                                            break
+                                    
+                                    # 如果还是没找到，尝试查找所有包含链接的 div
+                                    if not result_block:
+                                        all_divs = soup.find_all("div")
+                                        result_block = []
+                                        for div in all_divs:
+                                            # 查找包含 /url?q= 链接的 div
+                                            if div.find("a", href=lambda x: x and x.startswith("/url?q=")):
+                                                result_block.append(div)
+                                    
+                                    new_results = 0
+                                    
+                                    for result in result_block:
+                                        # 查找链接 - 更灵活的方式
+                                        link_tag = result.find("a", href=lambda x: x and (x.startswith("/url?q=") or x.startswith("http")))
+                                        
+                                        if not link_tag:
                                             continue
                                         
-                                        fetched_links.add(link)
-                                        title = title_tag.text
-                                        description = description_tag.text
+                                        # 尝试多种标题选择器
+                                        title_tag = None
+                                        title_selectors = [
+                                            ("h3", {}),
+                                            ("h3", {"class": "LC20lb"}),
+                                            ("h3", {"class": "DKV0Md"}),
+                                            ("div", {"class": "BNeawe"}),
+                                            ("span", {"class": "CVA68e"}),
+                                            ("div", {"role": "heading"}),
+                                            ("span", {"dir": "auto"}),
+                                        ]
                                         
-                                        # Store result in the same format as the API results
-                                        search_results.append({
-                                            "title": title,
-                                            "url": link,
-                                            "content": description,
-                                            "score": None,
-                                            "raw_content": description
-                                        })
+                                        for tag_name, attrs in title_selectors:
+                                            title_tag = result.find(tag_name, attrs)
+                                            if title_tag and title_tag.text.strip():
+                                                break
                                         
-                                        fetched_results += 1
-                                        new_results += 1
+                                        # 如果还是没有找到标题，尝试从链接本身获取
+                                        if not title_tag:
+                                            title_tag = link_tag
                                         
-                                        if fetched_results >= max_results:
-                                            break
-                                
-                                if new_results == 0:
-                                    break
+                                        # 尝试多种描述选择器    
+                                        description_tag = None
+                                        desc_selectors = [
+                                            ("div", {"class": "VwiC3b"}),
+                                            ("span", {"class": "FrIlee"}),
+                                            ("span", {"class": "st"}),
+                                            ("div", {"class": "BNeawe", "style": True}),
+                                            ("div", {"data-content-feature": "1"}),
+                                            ("div", {"style": "-webkit-line-clamp:2"}),
+                                            ("span", {"class": "aCOpRe"}),
+                                        ]
+                                        
+                                        for tag_name, attrs in desc_selectors:
+                                            description_tag = result.find(tag_name, attrs)
+                                            if description_tag and description_tag.text.strip():
+                                                break
+                                        
+                                        # 如果没有找到描述，尝试获取结果块的所有文本
+                                        if not description_tag:
+                                            # 获取结果中的所有文本，排除标题
+                                            all_text = result.get_text(separator=" ", strip=True)
+                                            if title_tag:
+                                                title_text = title_tag.get_text(strip=True)
+                                                desc_text = all_text.replace(title_text, "").strip()
+                                                if desc_text:
+                                                    # 创建一个虚拟的描述标签
+                                                    from bs4 import NavigableString
+                                                    description_tag = NavigableString(desc_text[:200])
+                                        
+                                        if link_tag and title_tag:
+                                            # 提取链接
+                                            href = link_tag.get("href", "")
+                                            if href.startswith("/url?q="):
+                                                link = unquote(href.split("?q=")[1].split("&")[0])
+                                            elif href.startswith("http"):
+                                                link = href
+                                            else:
+                                                continue
+                                            
+                                            # 过滤 Google 内部链接
+                                            if link.startswith("http") and "google.com" not in link:
+                                                if link in fetched_links:
+                                                    continue
+                                                
+                                                fetched_links.add(link)
+                                                title = title_tag.text.strip() if hasattr(title_tag, 'text') else str(title_tag).strip()
+                                                description = description_tag.text.strip() if description_tag and hasattr(description_tag, 'text') else str(description_tag).strip() if description_tag else ""
+                                                
+                                                # Store result in the same format as the API results
+                                                search_results.append({
+                                                    "title": title,
+                                                    "url": link,
+                                                    "content": description,
+                                                    "score": None,
+                                                    "raw_content": description
+                                                })
+                                                
+                                                fetched_results += 1
+                                                new_results += 1
+                                                
+                                                if fetched_results >= max_results:
+                                                    break
                                     
-                                start += 10
-                                time.sleep(1)  # Delay between pages
+                                    if new_results == 0:
+                                        break
+                                        
+                                    start += 10
+                                    time.sleep(2.0 + random.random() * 2.0)  # 增加分页延迟到 2-4 秒
+                                    
+                                    # 重置重试计数
+                                    retry_count = 0
+                                    
+                                except requests.exceptions.RequestException as e:
+                                    logger.error(f"Google search request failed, retry {retry_count}/{max_retries}: {str(e)}")
+                                    if retry_count < max_retries - 1:
+                                        retry_count += 1
+                                        logger.warning(f"Google search request failed, retry {retry_count}/{max_retries}: {str(e)}")
+                                        time.sleep(5 * (2 ** retry_count))
+                                        continue
+                                    else:
+                                        break
                             
                             return search_results
                                 
@@ -1216,6 +1390,35 @@ async def google_custom_search_async(search_queries: Union[str, List[str]], max_
                     results = search_results
                 
                 logger.info(f"Google search completed - results: {results}")
+                
+                # 如果爬虫模式没有获取到结果，尝试使用 DuckDuckGo 作为备用
+                if len(results) == 0:
+                    logger.warning(f"Google web scraping returned no results, falling back to DuckDuckGo - query: {query}")
+                    try:
+                        # 使用 DuckDuckGo 搜索
+                        with DDGS() as ddgs:
+                            ddg_results = list(ddgs.text(query, max_results=max_results))
+                            
+                            # 转换 DuckDuckGo 结果格式
+                            for i, ddg_result in enumerate(ddg_results):
+                                results.append({
+                                    "title": ddg_result.get('title', ''),
+                                    "url": ddg_result.get('href', ''),
+                                    "content": ddg_result.get('body', ''),
+                                    "score": 1.0 - (i * 0.1),
+                                    "raw_content": ddg_result.get('body', ''),
+                                    "source": "duckduckgo_fallback"
+                                })
+                            
+                            logger.info(f"DuckDuckGo fallback search completed - results_count: {len(results)}, query: {query}")
+                            
+                            # 添加随机暂停，避免被检测为机器人
+                            pause_duration = random.uniform(1, 5)
+                            logger.debug(f"Random pause for {pause_duration:.2f} seconds to avoid rate limiting")
+                            await asyncio.sleep(pause_duration)
+                    
+                    except Exception as e:
+                        logger.error(f"DuckDuckGo fallback search failed - query: {query}, error: {str(e)}, error_type: {type(e).__name__}")
                 
                 # Use smart content fetching to optimize data retrieval process
                 if include_raw_content and results and PLAYWRIGHT_UTILS_AVAILABLE:
@@ -1254,7 +1457,7 @@ async def google_custom_search_async(search_queries: Union[str, List[str]], max_
                                 url = result['url']
                                 if url in url_to_content:
                                     fetch_result = url_to_content[url]
-                                    logger.info(f"[loop] result: {result} \n url: {url}, \n url_to_content: {url_to_content}, \n fetch_result: {fetch_result} \n")
+                                    # logger.info(f"[loop] result: {result} \n url: {url}, \n url_to_content: {url_to_content}, \n fetch_result: {fetch_result} \n")
                                     if fetch_result['success']:
                                         # Successfully fetched content
                                         result['raw_content'] = fetch_result['content']
@@ -1327,7 +1530,7 @@ async def google_custom_search_async(search_queries: Union[str, List[str]], max_
             executor.shutdown(wait=False)
 
 @traceable
-async def gemini_google_search_async(search_queries: Union[str, List[str]], max_results: int = 5, include_raw_content: bool = True):
+async def gemini_google_search_async(search_queries: Union[str, List[str]], max_results: int = 5, include_raw_content: bool = True, model_name: Optional[str] = None):
     """
     Enhanced search using Gemini (combining Google Search and AI analysis)
     
@@ -1335,6 +1538,7 @@ async def gemini_google_search_async(search_queries: Union[str, List[str]], max_
         search_queries (Union[str, List[str]]): List of search queries
         max_results (int): Maximum number of results to return per query
         include_raw_content (bool): Whether to include raw content
+        model_name (Optional[str]): Gemini model name to use. If None, uses default model
         
     Returns:
         List[dict]: List of formatted search results
@@ -1354,8 +1558,16 @@ async def gemini_google_search_async(search_queries: Union[str, List[str]], max_
     
     # Use Gemini for enhanced analysis of search results
     try:
+        # Use provided model name or default
+        if model_name:
+            # Extract model name from full format if necessary (e.g., "google_genai:gemini-2.5-flash" -> "gemini-2.5-flash")
+            if ":" in model_name:
+                model_name = model_name.split(":", 1)[1]
+        else:
+            model_name = "gemini-2.5-flash-lite-preview-06-17"
+            
         gemini_model = ChatGoogleGenerativeAI(
-            model="gemini-2.5-flash-lite-preview-06-17",
+            model=model_name,
             temperature=0,
             max_retries=2
         )
@@ -1364,12 +1576,25 @@ async def gemini_google_search_async(search_queries: Union[str, List[str]], max_
         
         for result in search_results:
             query = result['query']
+            logger.info(f"Gemini Google Search [ChatGoogleGenerativeAI] - query: {query}")
             
-            # Build analysis prompt
-            sources_summary = "\n".join([
-                f"Title: {item['title']}\nURL: {item['url']}\nContent: {item['content'][:300]}...\n"
-                for item in result['results'][:3]  # Only analyze first 3 results
-            ])
+            # Skip if query is empty or missing
+            if not query or not query.strip():
+                logger.warning(f"Skipping empty or missing query in search result")
+                enhanced_results.append(result)
+                continue
+            
+            results = result['results']
+            logger.info(f"Gemini Google Search [ChatGoogleGenerativeAI] - results: {results}")
+            # Check if results exist before processing
+            if results and len(results) > 0:
+                # Build analysis prompt
+                sources_summary = "\n".join([
+                    f"Title: {item['title']}\nURL: {item['url']}\nContent: {item['content'][:300]}...\n"
+                    for item in results[:3]  # Only analyze first 3 results
+                ])
+            else:
+                sources_summary = "\n"
             
             analysis_prompt = f"""
             Based on the following search results, provide a comprehensive analysis and summary for the query "{query}":
@@ -1807,11 +2032,20 @@ async def gemini_google_search(
     Returns:
         str: Formatted search results string
     """
+    # Extract model name from config if available
+    model_name = None
+    if config:
+        from open_deep_research.configuration import Configuration
+        configurable = Configuration.from_runnable_config(config)
+        # Note: Using researcher_model for graph workflow compatibility
+        model_name = getattr(configurable, 'researcher_model', None)
+        
     # Use gemini_google_search_async to perform search
     search_results = await gemini_google_search_async(
         queries,
         max_results=max_results,
-        include_raw_content=True
+        include_raw_content=True,
+        model_name=model_name
     )
     
     # Format output
@@ -1871,7 +2105,7 @@ async def gemini_google_search(
         return "No valid search results found using Gemini Google Search. Please try different search queries."
 
 
-async def select_and_execute_search(search_api: str, query_list: list[str], params_to_pass: dict, enable_playwright_optimization: bool = True) -> str:
+async def select_and_execute_search(search_api: str, query_list: list[str], params_to_pass: dict, enable_playwright_optimization: bool = True, config: Optional[RunnableConfig] = None) -> str:
     """Select and execute the appropriate search API with optional Playwright optimization.
     
     Args:
@@ -1879,6 +2113,7 @@ async def select_and_execute_search(search_api: str, query_list: list[str], para
         query_list: List of search queries to execute
         params_to_pass: Parameters to pass to the search API
         enable_playwright_optimization: Whether to enable Playwright optimization for raw search results
+        config: Optional runtime configuration
         
     Returns:
         Formatted string containing search results
@@ -1947,7 +2182,13 @@ async def select_and_execute_search(search_api: str, query_list: list[str], para
             logger.info(f"Azure AI search results: {search_results}")
         elif search_api == "geminigooglesearch":
             logger.debug("Using Gemini Google search")
-            search_results = await gemini_google_search_async(query_list, **params_to_pass)
+            # Extract model name from config if available
+            model_name = None
+            if config:
+                from open_deep_research.configuration import MultiAgentConfiguration
+                configurable = MultiAgentConfiguration.from_runnable_config(config)
+                model_name = get_config_value(configurable.researcher_model)
+            search_results = await gemini_google_search_async(query_list, model_name=model_name, **params_to_pass)
             logger.info(f"Gemini Google search completed - result_length: {len(search_results)}")
             logger.info(f"Gemini Google search results: {search_results}")
         else:
@@ -2006,7 +2247,7 @@ async def select_and_execute_search(search_api: str, query_list: list[str], para
     elif not PLAYWRIGHT_UTILS_AVAILABLE:
         logger.warning("Playwright tool not available, skipping optimization")
 
-    return deduplicate_and_format_sources(search_results, max_tokens_per_source=10000, deduplication_strategy="keep_first")
+    return deduplicate_and_format_sources(search_results, max_tokens_per_source=50000, deduplication_strategy="keep_first")
 
 
 class Summary(BaseModel):
@@ -2205,7 +2446,7 @@ async def intelligent_search_web_unified(
                     if search_api != "none":
                         enhanced_queries = result.get("queries", queries)
                         logger.info(f"Using enhanced queries for traditional search - enhanced_queries_count: {len(enhanced_queries)}, enhanced_queries: {enhanced_queries[:3]}")
-                        return await select_and_execute_search(search_api, enhanced_queries, search_params or {})
+                        return await select_and_execute_search(search_api, enhanced_queries, search_params or {}, config=config)
                     else:
                         # If it's none API, return basic results from intelligent research
                         queries_count = len(result.get("queries", []))
@@ -2232,7 +2473,8 @@ async def intelligent_search_web_unified(
             search_api, 
             queries, 
             search_params or {}, 
-            enable_playwright_optimization=enable_optimization
+            enable_playwright_optimization=enable_optimization,
+            config=config
         )
         
         logger.info(f"Unified intelligent search completed - search_api: {search_api}, result_length: {len(result) if result else 0}")
@@ -2247,7 +2489,7 @@ async def intelligent_search_web_unified(
 async def optimize_search_results_with_playwright(
     search_results: List[Dict[str, Any]], 
     max_concurrent: int = 3,
-    content_char_limit: int = 50000
+    content_char_limit: int = 40000
 ) -> List[Dict[str, Any]]:
     """
     Optimize search results using Playwright intelligent content fetching
@@ -2310,8 +2552,8 @@ async def optimize_search_results_with_playwright(
                     content = fetch_result['content']
                     
                     # Content length limit
-                    if len(content) > content_char_limit:
-                        content = content[:content_char_limit] + "\n\n[Content truncated...]"
+                    if len(content) > content_char_limit * 2:
+                        content = content[:content_char_limit * 2] + "\n\n[Content truncated...]"
                     
                     # Update results
                     result['raw_content'] = content
@@ -2373,8 +2615,8 @@ def get_enhanced_search_summary(search_results: List[Dict[str, Any]]) -> str:
     
     method_summary = ", ".join([f"{method}: {count}" for method, count in methods.items()])
     
-    return f"📊 Search Results Summary: Total {total_results} results, {enhanced_count} content enhanced successfully\n" \
-           f"🔧 Fetch Methods Distribution: {method_summary}"
+    return f"Search Results Summary: Total {total_results} results, {enhanced_count} content enhanced successfully\n" \
+           f"Fetch Methods Distribution: {method_summary}"
            
 def extract_json_from_markdown(self, content: str) -> str:
     """Extract JSON string from Markdown formatted response"""

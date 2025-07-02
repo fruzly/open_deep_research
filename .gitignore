@@ -76,3 +76,5 @@ tests/history/*
 stable_report*.md
 consolidated_report*.md
 GOOGLE_SEARCH*.md
+
+test*.py
